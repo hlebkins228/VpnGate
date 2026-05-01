@@ -1,8 +1,17 @@
 //go:build linux
 
+// Command myvpn-server — VPN-сервер для Linux.
+//
+// Транспорт — WebSocket: HTTP-вебхук Yandex API Gateway (POST /ws) и/или
+// прямой WS-эндпоинт для локальной отладки. TUN использует
+// golang.zx2c4.com/wireguard/tun, NAT — iptables MASQUERADE.
+//
+// Конфигурация: основные параметры доступны как флагами, так и переменными
+// окружения. Редко меняемое — только через переменные окружения.
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"flag"
 	"fmt"
@@ -12,33 +21,22 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"myvpn/internal/envcfg"
 	"myvpn/internal/transport"
 	"myvpn/server"
 )
 
-// Конфигурация сервера максимально лаконична: основные параметры доступны
-// одновременно как флаги и как переменные окружения, остальное — переменные
-// окружения с разумными значениями по умолчанию.
+// shutdownTimeout — максимальное время на graceful shutdown.
 //
-// Флаги:
-//
-//	-key       путь к файлу с ключом (если не задан — будет сгенерирован случайный) (env MYVPN_KEY)
-//	-listen    адрес HTTP-сервера                                                   (env MYVPN_LISTEN, default :8080)
-//	-direct-ws включить локальный WS endpoint для отладки без API Gateway           (env MYVPN_DIRECT_WS)
-//	-verbose   подробное логирование                                                (env MYVPN_VERBOSE)
-//
-// Переменные окружения (без дублирующих флагов):
-//
-//	YC_IAM_TOKEN              статический IAM-токен Yandex Cloud (sensitive — env-only)
-//	MYVPN_IAM_TOKEN_FILE      путь к файлу с IAM-токеном (читается периодически)
-//	MYVPN_PPROF_ADDR          адрес pprof HTTP сервера (пусто = выключен)
-//	MYVPN_WEBHOOK_PATH        путь webhook (default /ws)
-//	MYVPN_DIRECT_WS_PATH      путь прямого WS (default /ws-direct, действует при -direct-ws)
-//	MYVPN_DISABLE_YANDEX_API  true|false — выключить Yandex API push (только direct WS)
-//	YC_METADATA_URL           переопределить URL metadata-сервиса
-//	YC_CONNECTIONS_API_URL    переопределить базовый URL Connection Management API
+// За это время сервер должен:
+//   - закрыть TUN (мгновенно);
+//   - отправить close-фреймы активным WS-клиентам и дождаться их закрытия;
+//   - завершить in-flight webhook'и от Yandex API Gateway;
+//   - откатить iptables/NAT.
+const shutdownTimeout = 10 * time.Second
+
 func main() {
 	var (
 		keyFile = flag.String("key", envcfg.String("MYVPN_KEY", ""),
@@ -77,7 +75,7 @@ func main() {
 	if !disableYC {
 		tokens, err := transport.LoadIAMTokenProvider(
 			iamTokenFile,
-			"", // -iam-token flag is gone; sensitive values come from env only
+			"", // -iam-token флаг убран; чувствительные значения только из env
 			"YC_IAM_TOKEN",
 			iamMetadataURL,
 		)
@@ -119,44 +117,49 @@ func main() {
 		}()
 	}
 
-	sigChan := make(chan os.Signal, 1)
+	// Первый сигнал → graceful shutdown с таймаутом.
+	// Второй сигнал → форсированный выход.
+	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	log.Println("VPN server started. Press Ctrl+C to stop.")
+	log.Println("VPN server started. Press Ctrl+C to stop (twice to force quit).")
 	<-sigChan
+	log.Printf("Shutting down server (graceful timeout %s)...", shutdownTimeout)
 
-	log.Println("Shutting down server...")
-	if err := srv.Stop(); err != nil {
-		log.Printf("Error stopping server: %v", err)
+	go func() {
+		<-sigChan
+		log.Fatalf("Forced shutdown — exiting immediately")
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("Error during shutdown: %v", err)
 	}
 
 	log.Println("Server stopped.")
 }
 
-// loadOrGenerateKey загружает ключ из файла или генерирует новый.
+// loadOrGenerateKey загружает ключ из файла или генерирует случайный.
 func loadOrGenerateKey(keyFile string) ([]byte, error) {
-	const keySize = 32 // 32 байта для ChaCha20-Poly1305
+	const keySize = 32
 
 	if keyFile != "" {
 		key, err := os.ReadFile(keyFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read key file: %w", err)
+			return nil, fmt.Errorf("read key file: %w", err)
 		}
-
 		if len(key) != keySize {
-			return nil, fmt.Errorf("invalid key size: expected %d bytes, got %d", keySize, len(key))
+			return nil, fmt.Errorf("invalid key size: got %d, want %d", len(key), keySize)
 		}
-
 		return key, nil
 	}
 
 	key := make([]byte, keySize)
 	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("failed to generate key: %w", err)
+		return nil, fmt.Errorf("generate random key: %w", err)
 	}
-
-	log.Println("Generated random encryption key. Save it for client configuration!")
-	log.Printf("Key (hex): %x\n", key)
-
+	log.Printf("Generated random key. Hex: %x", key)
+	log.Println("Save this key and pass it to clients via -key (binary) or set MYVPN_KEY.")
 	return key, nil
 }

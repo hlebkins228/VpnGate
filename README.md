@@ -39,17 +39,17 @@
 
 ## Сборка
 
-Linux-сервер и Linux-клиент:
+Клиент кросс-платформенный — один и тот же `cmd/client` собирается под Linux и Windows. Под капотом TUN-интерфейс открывается через [`golang.zx2c4.com/wireguard/tun`](https://pkg.go.dev/golang.zx2c4.com/wireguard/tun) (Linux: `/dev/net/tun`, Windows: Wintun).
+
+Сервер — Linux-only из-за iptables/NAT.
 
 ```bash
+# Linux-сервер и Linux-клиент
 go build -o myvpn-server ./cmd/server
 go build -o myvpn-client ./cmd/client
-```
 
-Windows-клиент (можно собирать как на Windows, так и кросс-компиляцией с Linux):
-
-```bash
-GOOS=windows GOARCH=amd64 go build -o myvpn-client.exe ./cmd/client-windows
+# Windows-клиент (кросс-компиляция с Linux)
+GOOS=windows GOARCH=amd64 go build -o myvpn-client.exe ./cmd/client
 ```
 
 ## Настройка Yandex API Gateway
@@ -222,7 +222,7 @@ sudo MYVPN_SERVER="wss://d5d...apigw.yandexcloud.net/ws" \
 
 ## Запуск VPN-клиента на Windows 11
 
-На Windows нет `/dev/net/tun`, поэтому отдельный бинарник `cmd/client-windows` использует драйвер [Wintun](https://www.wintun.net/) (тот же, что в WireGuard). Шифрование, сжатие и WebSocket-транспорт переиспользуются как есть.
+Клиент тот же самый `cmd/client`, просто собранный под Windows. На Windows TUN-интерфейс реализуется через драйвер [Wintun](https://www.wintun.net/) (тот же, что использует WireGuard). Доступ к Wintun делает библиотека `golang.zx2c4.com/wireguard/tun` — мы не пишем низкоуровневый код самостоятельно.
 
 ### Подготовка
 
@@ -248,33 +248,14 @@ $env:MYVPN_KEY     = "C:\myvpn\key.bin"
 
 При запуске клиент:
 
-- создаёт Wintun-адаптер с именем `MyVPN` и IP `10.0.0.2/24`;
+- создаёт Wintun-адаптер с именем `myvpn0` и IP `10.0.0.2/24`;
 - через `netsh` ставит MTU 1420;
 - если `MYVPN_AUTO_ROUTES ≠ false`, добавляет три маршрута через `route.exe`:
   - host-маршрут к API Gateway через прежний шлюз (чтобы не потерять связь);
   - `0.0.0.0/1` и `128.0.0.0/1` через туннель (split default route — перекрывают весь IPv4-простор без удаления оригинального дефолта);
 - при выходе аккуратно удаляет добавленные маршруты и закрывает Wintun-сессию.
 
-### Параметры клиента (Windows)
-
-Те же, что у Linux-клиента, плюс одна дополнительная переменная:
-
-| Флаг | Env | Описание | По умолчанию |
-|---|---|---|---|
-| `-server` | `MYVPN_SERVER` | WebSocket URL VPN-сервера / API Gateway | — (обязательно) |
-| `-key` | `MYVPN_KEY` | файл с ключом (32 байта или 64 hex-символа) | — (обязательно) |
-| `-ip` | `MYVPN_CLIENT_IP` | IP клиента в туннеле | `10.0.0.2` |
-| `-verbose` | `MYVPN_VERBOSE` | подробное логирование | `false` |
-
-Доп. env (без флагов):
-
-| Переменная | Описание | По умолчанию |
-|---|---|---|
-| `MYVPN_TUN_GATEWAY` | IP сервера внутри туннеля (используется как next-hop для split default route) | `10.0.0.1` |
-| `MYVPN_AUTO_ROUTES` | `true`/`false` — автоматическая настройка маршрутов | `true` |
-| `MYVPN_INSECURE_TLS` | `true`/`false` — отключить проверку TLS-сертификата | `false` |
-| `MYVPN_PPROF_ADDR` | адрес pprof HTTP-сервера (пусто = выключен) | — |
-| `MYVPN_WS_HEADERS` | дополнительные заголовки WS-рукопожатия | — |
+Параметры клиента полностью совпадают с Linux-версией (см. таблицы выше).
 
 ### Известные нюансы Windows-клиента
 
@@ -327,14 +308,29 @@ echo "1a2b3c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890" | xxd -r
 ## Структура репозитория
 
 ```
-client/                  — Linux-клиент: TUN (/dev/net/tun), RouteManager (`ip`)
-client/winclient/        — Windows-клиент: Wintun + netsh/route
-server/                  — Linux-сервер: TUN, NAT, NetworkManager
-internal/                — общий код (шифрование, протокол, сжатие, envcfg, пул буферов)
+client/                  — кросс-платформенный VPN-клиент:
+                            tun.go            — общий wrapper над wireguard/tun
+                            tun_linux.go      — настройка интерфейса через `ip`
+                            tun_windows.go    — настройка интерфейса через `netsh`
+                            routes_linux.go   — RouteManager на `ip route`
+                            routes_windows.go — RouteManager на `route.exe` (split default)
+                            client.go         — общая логика VPNClient
+server/                  — Linux VPN-сервер: TUN (через wireguard/tun), NAT (iptables)
+internal/                — общий код (шифрование ChaCha20-Poly1305, сжатие LZ4, envcfg)
 internal/transport/      — транспорт WebSocket (клиент + серверный HTTP webhook +
                            клиент Connection Management API + IAM-провайдеры)
-cmd/client/              — CLI Linux-клиента (myvpn-client)
-cmd/client-windows/      — CLI Windows-клиента (myvpn-client.exe, требует wintun.dll)
-cmd/server/              — CLI сервера (myvpn-server)
+cmd/client/              — CLI клиента (собирается под Linux и Windows из одного исходника)
+cmd/server/              — CLI сервера (Linux-only)
 examples/api-gateway.yaml — готовая OpenAPI-спецификация для Yandex API Gateway
 ```
+
+## Graceful shutdown
+
+Сервер реагирует на `SIGINT`/`SIGTERM` корректным завершением (по умолчанию таймаут — 10 секунд):
+
+1. Закрывается TUN-интерфейс — это разблокирует читателя и не даёт ядру слать пакеты в уже отключённый туннель.
+2. WebSocket-транспорт рассылает всем активным клиентам close-фреймы (`CloseNormalClosure`) и закрывает их соединения.
+3. `http.Server.Shutdown(ctx)` ждёт окончания in-flight webhook'ов от Yandex API Gateway.
+4. Откатываются iptables-правила (`MASQUERADE`, `FORWARD`) и возвращается прежнее значение `net.ipv4.ip_forward`.
+
+Повторный `Ctrl+C` в течение этих 10 секунд приведёт к немедленному `os.Exit(1)` — на случай, если что-то зависло. Клиент симметрично корректно закрывает TUN, восстанавливает таблицу маршрутизации и закрывает WebSocket.

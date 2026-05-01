@@ -258,8 +258,33 @@ func (t *WSServerTransport) Conns() []string {
 	return ids
 }
 
-// Close корректно завершает работу транспорта.
+// Close корректно завершает работу транспорта c таймаутом 5 секунд.
+//
+// Эквивалентно Shutdown(context.Background()) + жёсткое закрытие listener'а
+// при таймауте. Для более тонкого контроля используйте Shutdown.
 func (t *WSServerTransport) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return t.Shutdown(ctx)
+}
+
+// Shutdown — graceful-завершение транспорта.
+//
+// Порядок:
+//  1. Сигнализируем горутинам остановиться (close(done)).
+//  2. Отправляем close-фрейм всем активным WebSocket-клиентам и закрываем
+//     их sink'и.
+//  3. http.Server.Shutdown(ctx) — даёт in-flight webhook'ам завершиться;
+//     одновременно прерывает Serve.
+//  4. Ждём окончания всех goroutine, привязанных к транспорту (Serve и
+//     handleDirectWS), с учётом ctx.
+//  5. Закрываем канал incoming.
+//
+// Если ctx истекает раньше чем горутины успели завершиться, мы всё равно
+// продолжаем последовательность: Close() listener'а / sink'ов уже произошёл,
+// поэтому на горутины давление есть, и в большинстве случаев они выйдут
+// почти сразу после возврата Shutdown.
+func (t *WSServerTransport) Shutdown(ctx context.Context) error {
 	t.closeMu.Lock()
 	if t.closed {
 		t.closeMu.Unlock()
@@ -269,21 +294,38 @@ func (t *WSServerTransport) Close() error {
 	close(t.done)
 	t.closeMu.Unlock()
 
-	// Закрываем все sink'и
+	// Снимаем sink'и из карты под блокировкой, а Close() вызываем уже без неё:
+	// directWSSink.Close() пишет в WS-соединение, и блокировать карту
+	// connsMu всё это время не нужно.
 	t.connsMu.Lock()
+	sinks := make([]connSink, 0, len(t.conns))
 	for id, sink := range t.conns {
-		_ = sink.Close()
+		sinks = append(sinks, sink)
 		delete(t.conns, id)
 	}
 	t.connsMu.Unlock()
+	for _, s := range sinks {
+		_ = s.Close()
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	if t.httpSrv != nil {
 		_ = t.httpSrv.Shutdown(ctx)
 	}
 
-	t.wg.Wait()
+	doneCh := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(doneCh)
+	}()
+	select {
+	case <-doneCh:
+	case <-ctx.Done():
+		// Ускоряем выход goroutine direct WS — listener уже закрыт Shutdown'ом,
+		// соединения тоже. Подождём ещё немного, чтобы избежать гонки на
+		// записи в incoming.
+		<-doneCh
+	}
+
 	close(t.incoming)
 	return nil
 }
@@ -391,7 +433,15 @@ func (t *WSServerTransport) unregisterConn(connID string) bool {
 }
 
 // handleDirectWS обрабатывает прямое WebSocket подключение (для локальной отладки).
+//
+// Goroutine этого хэндлера регистрируется в t.wg, чтобы Shutdown() мог
+// дождаться её перед закрытием канала incoming. Без этого был бы возможен
+// race: handleDirectWS выходит из ReadMessage с готовым сообщением и
+// пытается отправить в incoming уже после того, как Shutdown закрыл канал.
 func (t *WSServerTransport) handleDirectWS(w http.ResponseWriter, r *http.Request) {
+	t.wg.Add(1)
+	defer t.wg.Done()
+
 	conn, err := t.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws/direct: upgrade failed: %v", err)
