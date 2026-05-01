@@ -33,15 +33,23 @@
 
 - Go 1.25 или выше для сборки
 - Linux на сервере, права root/sudo (TUN, iptables, NAT)
-- Linux на клиенте, права root/sudo (TUN, маршрутизация)
+- На клиенте — Linux (root) или Windows 10/11 (администратор + [Wintun](https://www.wintun.net/))
 - Аккаунт в Yandex Cloud, созданный API Gateway, сервисный аккаунт с ролью `serverless.apiGateway.websocketWriter` (или эквивалентом для Connection Management API)
 - Публичный HTTPS-эндпоинт сервера, к которому API Gateway сможет постучать вебхуками (например, реверс-прокси за TLS-сертификатом)
 
 ## Сборка
 
+Linux-сервер и Linux-клиент:
+
 ```bash
 go build -o myvpn-server ./cmd/server
 go build -o myvpn-client ./cmd/client
+```
+
+Windows-клиент (можно собирать как на Windows, так и кросс-компиляцией с Linux):
+
+```bash
+GOOS=windows GOARCH=amd64 go build -o myvpn-client.exe ./cmd/client-windows
 ```
 
 ## Настройка Yandex API Gateway
@@ -212,6 +220,68 @@ sudo MYVPN_SERVER="wss://d5d...apigw.yandexcloud.net/ws" \
 | `MYVPN_PPROF_ADDR` | адрес pprof HTTP-сервера (пусто = выключен) | — |
 | `MYVPN_WS_HEADERS` | дополнительные HTTP-заголовки рукопожатия в виде `Key1: V1, Key2: V2` | — |
 
+## Запуск VPN-клиента на Windows 11
+
+На Windows нет `/dev/net/tun`, поэтому отдельный бинарник `cmd/client-windows` использует драйвер [Wintun](https://www.wintun.net/) (тот же, что в WireGuard). Шифрование, сжатие и WebSocket-транспорт переиспользуются как есть.
+
+### Подготовка
+
+1. Скачайте и распакуйте свежий релиз с https://www.wintun.net/builds/. Внутри лежит `wintun.dll` для разных архитектур.
+2. Скопируйте `wintun.dll` нужной разрядности (`amd64` для 64-битной Windows 11) **в ту же папку, где лежит `myvpn-client.exe`**, либо в `%SystemRoot%\System32`. Без этой DLL клиент не запустится.
+3. Запускайте PowerShell / cmd **от имени администратора** — Wintun-адаптер и правка таблицы маршрутизации требуют прав.
+
+### Команда запуска
+
+```powershell
+.\myvpn-client.exe `
+    -server "wss://d5d...apigw.yandexcloud.net/ws" `
+    -key C:\myvpn\key.bin
+```
+
+Или через переменные окружения:
+
+```powershell
+$env:MYVPN_SERVER  = "wss://d5d...apigw.yandexcloud.net/ws"
+$env:MYVPN_KEY     = "C:\myvpn\key.bin"
+.\myvpn-client.exe
+```
+
+При запуске клиент:
+
+- создаёт Wintun-адаптер с именем `MyVPN` и IP `10.0.0.2/24`;
+- через `netsh` ставит MTU 1420;
+- если `MYVPN_AUTO_ROUTES ≠ false`, добавляет три маршрута через `route.exe`:
+  - host-маршрут к API Gateway через прежний шлюз (чтобы не потерять связь);
+  - `0.0.0.0/1` и `128.0.0.0/1` через туннель (split default route — перекрывают весь IPv4-простор без удаления оригинального дефолта);
+- при выходе аккуратно удаляет добавленные маршруты и закрывает Wintun-сессию.
+
+### Параметры клиента (Windows)
+
+Те же, что у Linux-клиента, плюс одна дополнительная переменная:
+
+| Флаг | Env | Описание | По умолчанию |
+|---|---|---|---|
+| `-server` | `MYVPN_SERVER` | WebSocket URL VPN-сервера / API Gateway | — (обязательно) |
+| `-key` | `MYVPN_KEY` | файл с ключом (32 байта или 64 hex-символа) | — (обязательно) |
+| `-ip` | `MYVPN_CLIENT_IP` | IP клиента в туннеле | `10.0.0.2` |
+| `-verbose` | `MYVPN_VERBOSE` | подробное логирование | `false` |
+
+Доп. env (без флагов):
+
+| Переменная | Описание | По умолчанию |
+|---|---|---|
+| `MYVPN_TUN_GATEWAY` | IP сервера внутри туннеля (используется как next-hop для split default route) | `10.0.0.1` |
+| `MYVPN_AUTO_ROUTES` | `true`/`false` — автоматическая настройка маршрутов | `true` |
+| `MYVPN_INSECURE_TLS` | `true`/`false` — отключить проверку TLS-сертификата | `false` |
+| `MYVPN_PPROF_ADDR` | адрес pprof HTTP-сервера (пусто = выключен) | — |
+| `MYVPN_WS_HEADERS` | дополнительные заголовки WS-рукопожатия | — |
+
+### Известные нюансы Windows-клиента
+
+- **Wintun не входит в репозиторий**. DLL качается с https://www.wintun.net/ (MIT-лицензия от WireGuard), кладётся рядом с `.exe`. Можно встроить её через `//go:embed` и распаковывать на лету, но текущий клиент этого не делает.
+- **DNS**: split default route отправит DNS-запросы в туннель. Если у вас на корпоративном Wi-Fi есть локальный DNS — он не будет доступен, пока туннель активен. Решение — указать публичный DNS в настройках адаптера (`netsh interface ipv4 add dnsservers "MyVPN" 8.8.8.8`).
+- **IPv6 не маршрутизируется через VPN** — split default route добавлен только для IPv4. Если в системе включён IPv6 default-маршрут, IPv6-трафик пойдёт мимо туннеля. Чтобы этого избежать, отключите IPv6 на физическом интерфейсе или на адаптере Wintun.
+
 ## Локальная отладка без Yandex Cloud
 
 Чтобы протестировать VPN без реального API Gateway, у сервера есть «прямой» WebSocket-эндпоинт. Включите его флагом `-direct-ws`:
@@ -257,11 +327,14 @@ echo "1a2b3c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890" | xxd -r
 ## Структура репозитория
 
 ```
-client/                  — TUN, RouteManager и логика VPN-клиента
-server/                  — TUN, NAT, NetworkManager и логика VPN-сервера
-internal/                — общий код (шифрование, протокол, сжатие, пул буферов)
+client/                  — Linux-клиент: TUN (/dev/net/tun), RouteManager (`ip`)
+client/winclient/        — Windows-клиент: Wintun + netsh/route
+server/                  — Linux-сервер: TUN, NAT, NetworkManager
+internal/                — общий код (шифрование, протокол, сжатие, envcfg, пул буферов)
 internal/transport/      — транспорт WebSocket (клиент + серверный HTTP webhook +
                            клиент Connection Management API + IAM-провайдеры)
-cmd/{client,server}/     — CLI бинарники
+cmd/client/              — CLI Linux-клиента (myvpn-client)
+cmd/client-windows/      — CLI Windows-клиента (myvpn-client.exe, требует wintun.dll)
+cmd/server/              — CLI сервера (myvpn-server)
 examples/api-gateway.yaml — готовая OpenAPI-спецификация для Yandex API Gateway
 ```
