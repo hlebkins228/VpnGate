@@ -310,8 +310,7 @@ func (t *WSServerTransport) handleWebhook(w http.ResponseWriter, r *http.Request
 			http.Error(w, "push client not configured", http.StatusServiceUnavailable)
 			return
 		}
-		t.registerGatewayConn(connID)
-		if t.cfg.Verbose {
+		if t.registerGatewayConn(connID) {
 			log.Printf("ws/webhook: client %s connected via API Gateway", connID)
 		}
 		w.WriteHeader(http.StatusOK)
@@ -351,8 +350,7 @@ func (t *WSServerTransport) handleWebhook(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusOK)
 
 	case EventDisconnect:
-		t.unregisterConn(connID)
-		if t.cfg.Verbose {
+		if t.unregisterConn(connID) {
 			log.Printf("ws/webhook: client %s disconnected (status=%s reason=%s)",
 				connID,
 				r.Header.Get(HeaderDisconnectStatus),
@@ -366,17 +364,20 @@ func (t *WSServerTransport) handleWebhook(w http.ResponseWriter, r *http.Request
 }
 
 // registerGatewayConn регистрирует клиента, подключённого через Yandex API Gateway.
-func (t *WSServerTransport) registerGatewayConn(connID string) {
+// Возвращает true, если клиент был добавлен впервые.
+func (t *WSServerTransport) registerGatewayConn(connID string) bool {
 	t.connsMu.Lock()
 	defer t.connsMu.Unlock()
 	if _, exists := t.conns[connID]; exists {
-		return
+		return false
 	}
 	t.conns[connID] = &gatewaySink{push: t.cfg.PushClient, connID: connID}
+	return true
 }
 
 // unregisterConn удаляет клиента из таблицы подключений.
-func (t *WSServerTransport) unregisterConn(connID string) {
+// Возвращает true, если клиент действительно был удалён.
+func (t *WSServerTransport) unregisterConn(connID string) bool {
 	t.connsMu.Lock()
 	sink, ok := t.conns[connID]
 	if ok {
@@ -386,6 +387,7 @@ func (t *WSServerTransport) unregisterConn(connID string) {
 	if ok && sink != nil {
 		_ = sink.Close()
 	}
+	return ok
 }
 
 // handleDirectWS обрабатывает прямое WebSocket подключение (для локальной отладки).
@@ -402,6 +404,14 @@ func (t *WSServerTransport) handleDirectWS(w http.ResponseWriter, r *http.Reques
 	conn.SetReadLimit(WSMaxMessageSize)
 	if t.cfg.PongWait > 0 {
 		_ = conn.SetReadDeadline(time.Now().Add(t.cfg.PongWait))
+		// Любой ping/pong от клиента продлевает read deadline.
+		// Без кастомного PingHandler-а gorilla только отвечает понгом, но
+		// не продлевает дедлайн чтения, и соединение умрёт через PongWait.
+		defaultPingHandler := conn.PingHandler()
+		conn.SetPingHandler(func(appData string) error {
+			_ = conn.SetReadDeadline(time.Now().Add(t.cfg.PongWait))
+			return defaultPingHandler(appData)
+		})
 		conn.SetPongHandler(func(string) error {
 			_ = conn.SetReadDeadline(time.Now().Add(t.cfg.PongWait))
 			return nil
@@ -413,15 +423,11 @@ func (t *WSServerTransport) handleDirectWS(w http.ResponseWriter, r *http.Reques
 	t.conns[connID] = sink
 	t.connsMu.Unlock()
 
-	if t.cfg.Verbose {
-		log.Printf("ws/direct: client %s connected", connID)
-	}
+	log.Printf("ws/direct: client %s connected", connID)
 
 	defer func() {
 		t.unregisterConn(connID)
-		if t.cfg.Verbose {
-			log.Printf("ws/direct: client %s disconnected", connID)
-		}
+		log.Printf("ws/direct: client %s disconnected", connID)
 	}()
 
 	for {

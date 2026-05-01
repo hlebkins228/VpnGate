@@ -13,23 +13,6 @@ import (
 	"myvpn/internal/transport"
 )
 
-// Client представляет клиентское соединение, идентифицируемое по ConnID
-// (X-Yc-Apigateway-Websocket-Connection-Id или внутренний ID для прямого WS).
-type Client struct {
-	connID    string
-	connectAt time.Time
-	verbose   bool
-}
-
-// NewClient создаёт новую запись о клиенте.
-func NewClient(connID string, verbose bool) *Client {
-	return &Client{
-		connID:    connID,
-		connectAt: time.Now(),
-		verbose:   verbose,
-	}
-}
-
 // ServerConfig параметры VPN-сервера.
 type ServerConfig struct {
 	// Listen адрес HTTP-сервера, на который Yandex API Gateway шлёт webhook'и.
@@ -49,6 +32,10 @@ type ServerConfig struct {
 }
 
 // Server — VPN-сервер поверх WebSocket / HTTP webhook.
+//
+// Список активных клиентов хранит транспорт (см. transport.WSServerTransport),
+// поэтому здесь нет своей карты подключений — это устраняет утечку памяти при
+// разрыве соединений и гонки между webhook'ами CONNECT/MESSAGE/DISCONNECT.
 type Server struct {
 	cfg ServerConfig
 
@@ -56,9 +43,6 @@ type Server struct {
 	crypto         *internal.Crypto
 	transport      *transport.WSServerTransport
 	networkManager *NetworkManager
-
-	clientsMu sync.RWMutex
-	clients   map[string]*Client
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -95,7 +79,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		tun:            tun,
 		crypto:         crypto,
 		networkManager: networkManager,
-		clients:        make(map[string]*Client),
 		done:           make(chan struct{}),
 	}, nil
 }
@@ -170,7 +153,7 @@ func (s *Server) handleTunToClients() {
 	}
 }
 
-// broadcastPacket шифрует пакет и отправляет всем известным клиентам.
+// broadcastPacket шифрует пакет и отправляет всем активным клиентам транспорта.
 func (s *Server) broadcastPacket(packet []byte) {
 	encoded, err := s.encodePacket(packet)
 	if err != nil {
@@ -178,24 +161,16 @@ func (s *Server) broadcastPacket(packet []byte) {
 		return
 	}
 
-	s.clientsMu.RLock()
-	count := len(s.clients)
+	connIDs := s.transport.Conns()
 	if s.cfg.Verbose {
-		log.Printf("TUN: %d bytes -> %d client(s)", len(packet), count)
+		log.Printf("TUN: %d bytes -> %d client(s)", len(packet), len(connIDs))
 	}
-	if count == 0 {
-		s.clientsMu.RUnlock()
+	if len(connIDs) == 0 {
 		if s.cfg.Verbose {
 			log.Printf("Warning: no clients to send TUN packet to (dropped %d bytes)", len(packet))
 		}
 		return
 	}
-
-	connIDs := make([]string, 0, count)
-	for id := range s.clients {
-		connIDs = append(connIDs, id)
-	}
-	s.clientsMu.RUnlock()
 
 	for _, connID := range connIDs {
 		if err := s.transport.Send(connID, encoded); err != nil {
@@ -256,14 +231,6 @@ func (s *Server) handleClientsToTun() {
 			continue
 		}
 
-		// Регистрируем клиента, если он ещё не зарегистрирован
-		s.clientsMu.Lock()
-		if _, ok := s.clients[pkt.ConnID]; !ok {
-			s.clients[pkt.ConnID] = NewClient(pkt.ConnID, s.cfg.Verbose)
-			log.Printf("New client connected: %s", pkt.ConnID)
-		}
-		s.clientsMu.Unlock()
-
 		flags := pkt.Data[0]
 		isCompressed := (flags & internal.FlagCompressed) != 0
 		encrypted := pkt.Data[1:]
@@ -290,16 +257,6 @@ func (s *Server) handleClientsToTun() {
 				log.Printf("Error writing packet to TUN: %v", err)
 			}
 		}
-	}
-}
-
-// RemoveClient удаляет клиента из таблицы (вызывается при $disconnect).
-func (s *Server) RemoveClient(connID string) {
-	s.clientsMu.Lock()
-	defer s.clientsMu.Unlock()
-	if _, ok := s.clients[connID]; ok {
-		delete(s.clients, connID)
-		log.Printf("Client disconnected: %s", connID)
 	}
 }
 

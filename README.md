@@ -104,28 +104,37 @@ VPN-сервер должен быть доступен из интернета 
 
 ### IAM-токен для Connection Management API
 
-Сервер должен уметь дёргать `apigateway-connections.api.cloud.yandex.net`, поэтому ему нужен IAM-токен сервисного аккаунта. Поддерживаются три источника, в порядке приоритета:
+Сервер должен уметь дёргать `apigateway-connections.api.cloud.yandex.net`, поэтому ему нужен IAM-токен сервисного аккаунта. Поддерживаются три источника (выбираются в этом порядке приоритета):
 
-1. `-iam-token-file <path>` — токен читается из файла и периодически перечитывается (раз в 5 минут). Подходит для случая, когда внешний скрипт обновляет файл, например:
+1. `MYVPN_IAM_TOKEN_FILE=<path>` — токен читается из файла и периодически перечитывается (раз в 5 минут). Подходит для случая, когда внешний скрипт обновляет файл, например:
 
    ```bash
    # каждый час по cron
    yc iam create-token --service-account-name myvpn-gw > /run/yc-iam-token
    ```
 
-2. `-iam-token <token>` или переменная окружения `YC_IAM_TOKEN` — статический токен (живёт около 12 часов после `yc iam create-token`).
+2. `YC_IAM_TOKEN=<token>` — статический токен в переменной окружения (живёт около 12 часов после `yc iam create-token`).
 
-3. **Метадата-сервис** — если сервер запущен на Yandex Compute Cloud-ВМ с привязанным сервисным аккаунтом, токен автоматически берётся с `http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token` и автообновляется. По умолчанию используется этот источник, если не заданы первые два.
+3. **Метадата-сервис** — если сервер запущен на Yandex Compute Cloud-ВМ с привязанным сервисным аккаунтом, токен автоматически берётся с `http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token` и автообновляется. Это источник по умолчанию, если не заданы первые два.
+
+Имя переменной metadata-URL можно переопределить через `YC_METADATA_URL`, базовый URL Connection Management API — через `YC_CONNECTIONS_API_URL`.
 
 ### Команда запуска
 
+На Yandex Compute Cloud-ВМ с привязанным SA достаточно:
+
 ```bash
-sudo ./myvpn-server \
-    -listen :8080 \
-    -webhook-path /ws \
-    -key /etc/myvpn/key.bin \
-    -iam-token-file /run/yc-iam-token
+sudo ./myvpn-server -key /etc/myvpn/key.bin
 ```
+
+Или с внешним IAM-токеном (обновляемым внешним cron):
+
+```bash
+sudo MYVPN_IAM_TOKEN_FILE=/run/yc-iam-token \
+    ./myvpn-server -key /etc/myvpn/key.bin
+```
+
+Все остальные параметры (`-listen`, webhook-путь, pprof) имеют разумные значения по умолчанию и при необходимости задаются переменными окружения (см. ниже).
 
 Сервер автоматически:
 
@@ -138,75 +147,92 @@ sudo ./myvpn-server \
 
 ### Параметры сервера
 
-| Флаг | Описание | По умолчанию |
+Флаги (самое часто изменяемое):
+
+| Флаг | Env-альтернатива | Описание | По умолчанию |
+|---|---|---|---|
+| `-key` | `MYVPN_KEY` | файл с 32-байтным ключом ChaCha20-Poly1305 | сгенерировать случайный |
+| `-listen` | `MYVPN_LISTEN` | адрес HTTP-сервера (вебхуки + опционально прямой WS) | `:8080` |
+| `-direct-ws` | `MYVPN_DIRECT_WS` | включить локальный WS-эндпоинт для отладки без API Gateway | `false` |
+| `-verbose` | `MYVPN_VERBOSE` | подробное логирование | `false` |
+
+Переменные окружения (без флагов, редко меняемое):
+
+| Переменная | Описание | По умолчанию |
 |---|---|---|
-| `-listen` | адрес HTTP-сервера (вебхуки + опционально прямой WS) | `:8080` |
-| `-webhook-path` | путь, на который Yandex API Gateway шлёт вебхуки | `/ws` |
-| `-direct-ws-path` | путь для прямого WebSocket (отладка без API Gateway, см. ниже). Пусто = выключено | `""` |
-| `-key` | файл с 32-байтным ключом ChaCha20-Poly1305 | сгенерировать случайный |
-| `-iam-token` | статический IAM-токен Yandex Cloud | — |
-| `-iam-token-file` | файл с IAM-токеном (перечитывается раз в 5 минут) | — |
-| `-iam-metadata-url` | URL метадата-сервиса для получения IAM | YC metadata |
-| `-yc-connections-api` | базовый URL Connection Management API | `https://apigateway-connections.api.cloud.yandex.net` |
-| `-disable-yandex-api` | выключить интеграцию с Yandex API Gateway (только прямой WS) | `false` |
-| `-verbose` | подробное логирование | `false` |
-| `-pprof` | адрес pprof | `:6060` |
-| `-metrics` | адрес метрик | `:6061` |
+| `YC_IAM_TOKEN` | статический IAM-токен Yandex Cloud | — |
+| `MYVPN_IAM_TOKEN_FILE` | путь к файлу с IAM-токеном (перечитывается раз в 5 минут) | — |
+| `MYVPN_PPROF_ADDR` | адрес pprof HTTP-сервера (пусто = выключен) | — |
+| `MYVPN_WEBHOOK_PATH` | путь, на который Yandex API Gateway шлёт вебхуки | `/ws` |
+| `MYVPN_DIRECT_WS_PATH` | путь прямого WS (используется при `-direct-ws=true`) | `/ws-direct` |
+| `MYVPN_DISABLE_YANDEX_API` | `true` — выключить push в Yandex API Gateway, оставив только прямой WS | `false` |
+| `YC_METADATA_URL` | переопределить URL metadata-сервиса IAM | YC metadata |
+| `YC_CONNECTIONS_API_URL` | переопределить базовый URL Connection Management API | `https://apigateway-connections.api.cloud.yandex.net` |
 
 ## Запуск VPN-клиента
 
 ```bash
 sudo ./myvpn-client \
     -server "wss://d5d...apigw.yandexcloud.net/ws" \
-    -key /etc/myvpn/key.bin \
-    -ip 10.0.0.2
+    -key /etc/myvpn/key.bin
+```
+
+Или с переменными окружения (удобно для systemd / docker):
+
+```bash
+sudo MYVPN_SERVER="wss://d5d...apigw.yandexcloud.net/ws" \
+    MYVPN_KEY=/etc/myvpn/key.bin \
+    ./myvpn-client
 ```
 
 Клиент автоматически:
 
-- создаст TUN-интерфейс `myvpn0` с указанным IP;
-- настроит маршрут «весь трафик через VPN» (если `-auto-routes=true`);
+- создаст TUN-интерфейс `myvpn0` с указанным IP (по умолчанию `10.0.0.2`);
+- настроит маршрут «весь трафик через VPN» (если `MYVPN_AUTO_ROUTES ≠ false`);
 - сохранит маршрут к домену API Gateway через старый шлюз, чтобы не терять связь;
 - при выходе восстановит оригинальные маршруты.
 
 ### Параметры клиента
 
-| Флаг | Описание | По умолчанию |
+Флаги (самое часто изменяемое):
+
+| Флаг | Env-альтернатива | Описание | По умолчанию |
+|---|---|---|---|
+| `-server` | `MYVPN_SERVER` | WebSocket URL (`wss://...apigw.yandexcloud.net/ws`) | — (обязательно) |
+| `-key` | `MYVPN_KEY` | файл с ключом (32 байта или 64 hex-символа) | — (обязательно) |
+| `-ip` | `MYVPN_CLIENT_IP` | IP TUN-интерфейса клиента | `10.0.0.2` |
+| `-verbose` | `MYVPN_VERBOSE` | подробное логирование | `false` |
+
+Переменные окружения (без флагов):
+
+| Переменная | Описание | По умолчанию |
 |---|---|---|
-| `-server` | WebSocket URL (например `wss://...apigw.yandexcloud.net/ws`) | — (обязательно) |
-| `-key` | файл с ключом (32 байта или 64 hex-символа) | — (обязательно) |
-| `-ip` | IP TUN-интерфейса клиента | `10.0.0.2` |
-| `-auto-routes` | автоматическая настройка маршрутов | `true` |
-| `-ws-headers` | дополнительные HTTP-заголовки рукопожатия в виде `Key1: V1, Key2: V2` | — |
-| `-insecure-tls` | отключить проверку TLS-сертификата (только для отладки) | `false` |
-| `-verbose` | подробное логирование | `false` |
-| `-pprof` | адрес pprof | `:6060` |
+| `MYVPN_AUTO_ROUTES` | `true`/`false` — автоматическая настройка маршрутов | `true` |
+| `MYVPN_INSECURE_TLS` | `true`/`false` — отключить проверку TLS-сертификата (только для отладки) | `false` |
+| `MYVPN_PPROF_ADDR` | адрес pprof HTTP-сервера (пусто = выключен) | — |
+| `MYVPN_WS_HEADERS` | дополнительные HTTP-заголовки рукопожатия в виде `Key1: V1, Key2: V2` | — |
 
 ## Локальная отладка без Yandex Cloud
 
-Чтобы протестировать VPN без реального API Gateway, у сервера есть «прямой» WebSocket-эндпоинт. Включите его флагом `-direct-ws-path`:
+Чтобы протестировать VPN без реального API Gateway, у сервера есть «прямой» WebSocket-эндпоинт. Включите его флагом `-direct-ws`:
 
 Сервер:
 
 ```bash
-sudo ./myvpn-server \
-    -listen :8080 \
-    -direct-ws-path /ws-direct \
-    -disable-yandex-api \
-    -key key.bin
+sudo MYVPN_DISABLE_YANDEX_API=true \
+    ./myvpn-server -direct-ws -key key.bin
 ```
 
 Клиент:
 
 ```bash
-sudo ./myvpn-client \
-    -server "ws://SERVER_IP:8080/ws-direct" \
-    -key key.bin \
-    -ip 10.0.0.2 \
-    -auto-routes=false
+sudo MYVPN_AUTO_ROUTES=false \
+    ./myvpn-client -server "ws://SERVER_IP:8080/ws-direct" -key key.bin
 ```
 
 В этом режиме сервер сам терминирует WebSocket-соединения и не вызывает Yandex API. Это удобно для проверки, что шифрование, TUN и маршрутизация настроены правильно, прежде чем заворачивать всё в API Gateway.
+
+Путь прямого WS по умолчанию — `/ws-direct`. Его можно поменять переменной `MYVPN_DIRECT_WS_PATH=/your-path`.
 
 ## Ключи шифрования
 

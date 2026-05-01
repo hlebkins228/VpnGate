@@ -10,41 +10,59 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
+	"myvpn/internal/envcfg"
 	"myvpn/internal/transport"
 	"myvpn/server"
 )
 
+// Конфигурация сервера максимально лаконична: основные параметры доступны
+// одновременно как флаги и как переменные окружения, остальное — переменные
+// окружения с разумными значениями по умолчанию.
+//
+// Флаги:
+//
+//	-key       путь к файлу с ключом (если не задан — будет сгенерирован случайный) (env MYVPN_KEY)
+//	-listen    адрес HTTP-сервера                                                   (env MYVPN_LISTEN, default :8080)
+//	-direct-ws включить локальный WS endpoint для отладки без API Gateway           (env MYVPN_DIRECT_WS)
+//	-verbose   подробное логирование                                                (env MYVPN_VERBOSE)
+//
+// Переменные окружения (без дублирующих флагов):
+//
+//	YC_IAM_TOKEN              статический IAM-токен Yandex Cloud (sensitive — env-only)
+//	MYVPN_IAM_TOKEN_FILE      путь к файлу с IAM-токеном (читается периодически)
+//	MYVPN_PPROF_ADDR          адрес pprof HTTP сервера (пусто = выключен)
+//	MYVPN_WEBHOOK_PATH        путь webhook (default /ws)
+//	MYVPN_DIRECT_WS_PATH      путь прямого WS (default /ws-direct, действует при -direct-ws)
+//	MYVPN_DISABLE_YANDEX_API  true|false — выключить Yandex API push (только direct WS)
+//	YC_METADATA_URL           переопределить URL metadata-сервиса
+//	YC_CONNECTIONS_API_URL    переопределить базовый URL Connection Management API
 func main() {
 	var (
-		listenAddr   = flag.String("listen", ":8080", "Address to listen on (HTTP webhook + optional direct WS)")
-		webhookPath  = flag.String("webhook-path", "/ws", "URL path for Yandex API Gateway webhook")
-		directWSPath = flag.String("direct-ws-path", "", "Optional direct WebSocket path for local testing without API Gateway (e.g. /ws-direct). Empty disables direct mode.")
-		keyFile      = flag.String("key", "", "Path to encryption key file (32 bytes). If not provided, a random key will be generated")
-		verbose      = flag.Bool("verbose", false, "Enable verbose logging (logs every packet)")
-		pprofAddr    = flag.String("pprof", ":6060", "Address for pprof HTTP server (empty to disable)")
-		metricsAddr  = flag.String("metrics", ":6061", "Address for metrics HTTP server (empty to disable)")
-
-		// Yandex Cloud authentication for the Connection Management API
-		// (used to push packets back to clients via API Gateway).
-		iamTokenFile = flag.String("iam-token-file", "",
-			"Path to a file containing a Yandex Cloud IAM token (refreshed periodically). "+
-				"Use this when running outside Yandex Cloud and refreshing the token externally.")
-		iamTokenValue = flag.String("iam-token", "",
-			"Yandex Cloud IAM token (static). For long-running servers prefer -iam-token-file or metadata service.")
-		iamMetadataURL = flag.String("iam-metadata-url", transport.YCMetadataTokenURL,
-			"URL of the Yandex Cloud metadata service for fetching IAM tokens. "+
-				"Used when no static token / token file is provided. Empty disables metadata lookup.")
-		yandexAPIBase = flag.String("yc-connections-api", transport.YCDefaultConnectionsAPIBase,
-			"Base URL of the Yandex API Gateway Connection Management API")
-		disableYC = flag.Bool("disable-yandex-api", false,
-			"Disable Yandex API Gateway integration (only -direct-ws-path will work). Useful for local testing.")
+		keyFile = flag.String("key", envcfg.String("MYVPN_KEY", ""),
+			"Path to encryption key file (32 bytes). If empty, a random key will be generated. Env: MYVPN_KEY.")
+		listenAddr = flag.String("listen", envcfg.String("MYVPN_LISTEN", ":8080"),
+			"Address to listen on (HTTP webhook + optional direct WS). Env: MYVPN_LISTEN.")
+		directWS = flag.Bool("direct-ws", envcfg.Bool("MYVPN_DIRECT_WS", false),
+			"Enable a local direct WebSocket endpoint (path from MYVPN_DIRECT_WS_PATH, default /ws-direct) for testing without API Gateway. Env: MYVPN_DIRECT_WS.")
+		verbose = flag.Bool("verbose", envcfg.Bool("MYVPN_VERBOSE", false),
+			"Enable verbose logging (logs every packet). Env: MYVPN_VERBOSE.")
 	)
 	flag.Parse()
 
-	if *directWSPath == "" && *disableYC {
-		log.Fatal("With -disable-yandex-api you must also provide -direct-ws-path " +
+	webhookPath := envcfg.String("MYVPN_WEBHOOK_PATH", "/ws")
+	directWSPath := ""
+	if *directWS {
+		directWSPath = envcfg.String("MYVPN_DIRECT_WS_PATH", "/ws-direct")
+	}
+	pprofAddr := envcfg.String("MYVPN_PPROF_ADDR", "")
+	disableYC := envcfg.Bool("MYVPN_DISABLE_YANDEX_API", false)
+	iamTokenFile := envcfg.String("MYVPN_IAM_TOKEN_FILE", "")
+	iamMetadataURL := envcfg.String("YC_METADATA_URL", transport.YCMetadataTokenURL)
+	yandexAPIBase := envcfg.String("YC_CONNECTIONS_API_URL", transport.YCDefaultConnectionsAPIBase)
+
+	if disableYC && directWSPath == "" {
+		log.Fatal("With MYVPN_DISABLE_YANDEX_API=true you must enable -direct-ws " +
 			"(otherwise the server has no way to talk to clients).")
 	}
 
@@ -54,20 +72,21 @@ func main() {
 	}
 
 	var pushClient *transport.YCPushClient
-	if !*disableYC {
+	if !disableYC {
 		tokens, err := transport.LoadIAMTokenProvider(
-			*iamTokenFile,
-			*iamTokenValue,
+			iamTokenFile,
+			"", // -iam-token flag is gone; sensitive values come from env only
 			"YC_IAM_TOKEN",
-			*iamMetadataURL,
+			iamMetadataURL,
 		)
 		if err != nil {
 			log.Fatalf("Failed to set up IAM token provider: %v\n"+
-				"Hint: provide one of -iam-token, -iam-token-file, YC_IAM_TOKEN env var, "+
-				"or run on a Yandex Cloud VM with a service account attached.", err)
+				"Hint: set YC_IAM_TOKEN env var, MYVPN_IAM_TOKEN_FILE env var, "+
+				"or run on a Yandex Cloud VM with a service account attached. "+
+				"For local testing without IAM, set MYVPN_DISABLE_YANDEX_API=true and pass -direct-ws.", err)
 		}
 		pushClient, err = transport.NewYCPushClient(transport.YCPushClientConfig{
-			BaseURL:       *yandexAPIBase,
+			BaseURL:       yandexAPIBase,
 			TokenProvider: tokens,
 		})
 		if err != nil {
@@ -77,8 +96,8 @@ func main() {
 
 	srv, err := server.NewServer(server.ServerConfig{
 		Listen:       *listenAddr,
-		WebhookPath:  *webhookPath,
-		DirectWSPath: *directWSPath,
+		WebhookPath:  webhookPath,
+		DirectWSPath: directWSPath,
 		Key:          key,
 		Verbose:      *verbose,
 		PushClient:   pushClient,
@@ -91,15 +110,11 @@ func main() {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 
-	if *pprofAddr != "" {
+	if pprofAddr != "" {
 		go func() {
-			log.Printf("Starting pprof server on %s", *pprofAddr)
-			log.Println(http.ListenAndServe(*pprofAddr, nil))
+			log.Printf("Starting pprof server on %s", pprofAddr)
+			log.Println(http.ListenAndServe(pprofAddr, nil))
 		}()
-	}
-
-	if *metricsAddr != "" {
-		go startMetricsServer(*metricsAddr)
 	}
 
 	sigChan := make(chan os.Signal, 1)
@@ -116,7 +131,7 @@ func main() {
 	log.Println("Server stopped.")
 }
 
-// loadOrGenerateKey загружает ключ из файла или генерирует новый
+// loadOrGenerateKey загружает ключ из файла или генерирует новый.
 func loadOrGenerateKey(keyFile string) ([]byte, error) {
 	const keySize = 32 // 32 байта для ChaCha20-Poly1305
 
@@ -142,19 +157,4 @@ func loadOrGenerateKey(keyFile string) ([]byte, error) {
 	log.Printf("Key (hex): %x\n", key)
 
 	return key, nil
-}
-
-// startMetricsServer запускает HTTP сервер для метрик
-func startMetricsServer(addr string) {
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintf(w, "# VPN Server Metrics\n")
-		fmt.Fprintf(w, "# Time: %s\n\n", time.Now().Format(time.RFC3339))
-		fmt.Fprintf(w, "metrics_endpoint_active 1\n")
-	})
-
-	log.Printf("Starting metrics server on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Printf("Metrics server error: %v", err)
-	}
 }

@@ -12,27 +12,49 @@ import (
 	"syscall"
 
 	"myvpn/client"
+	"myvpn/internal/envcfg"
 )
 
+// Конфигурация клиента максимально лаконична: обязательные параметры можно
+// задать как флагами, так и переменными окружения, остальное — переменные
+// окружения с разумными значениями по умолчанию.
+//
+// Флаги:
+//
+//	-server   wss://... URL сервера / Yandex API Gateway (env MYVPN_SERVER)
+//	-key      путь к файлу с ключом                       (env MYVPN_KEY)
+//	-ip       IP адрес TUN-интерфейса клиента             (env MYVPN_CLIENT_IP, default 10.0.0.2)
+//	-verbose  подробное логирование                       (env MYVPN_VERBOSE)
+//
+// Переменные окружения (без дублирующих флагов):
+//
+//	MYVPN_AUTO_ROUTES   true|false (default true) — направлять весь трафик в VPN
+//	MYVPN_INSECURE_TLS  true|false (default false) — пропускать проверку TLS-сертификата
+//	MYVPN_PPROF_ADDR    адрес pprof HTTP сервера (пусто = выключен)
+//	MYVPN_WS_HEADERS    "Key1: Val1, Key2: Val2" — доп. заголовки WebSocket-рукопожатия
 func main() {
 	var (
-		serverURL    = flag.String("server", "", "VPN server WebSocket URL (e.g., wss://d5d...apigw.yandexcloud.net/ws)")
-		keyFile      = flag.String("key", "", "Path to encryption key file (32 bytes binary or 64 hex chars)")
-		clientIP     = flag.String("ip", "10.0.0.2", "Client IP address for TUN interface")
-		verbose      = flag.Bool("verbose", false, "Enable verbose logging (logs every packet)")
-		pprofAddr    = flag.String("pprof", ":6060", "Address for pprof HTTP server (empty to disable)")
-		autoRoutes   = flag.Bool("auto-routes", true, "Automatically configure routes (redirect all traffic through VPN)")
-		insecureTLS  = flag.Bool("insecure-tls", false, "Skip TLS certificate verification (debug only)")
-		extraHeaders = flag.String("ws-headers", "", "Comma-separated extra WebSocket handshake headers in 'Key: Value' form")
+		serverURL = flag.String("server", envcfg.String("MYVPN_SERVER", ""),
+			"VPN server WebSocket URL (e.g. wss://...apigw.yandexcloud.net/ws). Env: MYVPN_SERVER.")
+		keyFile = flag.String("key", envcfg.String("MYVPN_KEY", ""),
+			"Path to encryption key file (32 bytes binary or 64 hex chars). Env: MYVPN_KEY.")
+		clientIP = flag.String("ip", envcfg.String("MYVPN_CLIENT_IP", "10.0.0.2"),
+			"Client IP address for TUN interface. Env: MYVPN_CLIENT_IP.")
+		verbose = flag.Bool("verbose", envcfg.Bool("MYVPN_VERBOSE", false),
+			"Enable verbose logging (logs every packet). Env: MYVPN_VERBOSE.")
 	)
 	flag.Parse()
 
-	if *serverURL == "" {
-		log.Fatal("Server URL is required. Use -server flag (e.g. wss://...apigw.yandexcloud.net/ws)")
-	}
+	autoRoutes := envcfg.Bool("MYVPN_AUTO_ROUTES", true)
+	insecureTLS := envcfg.Bool("MYVPN_INSECURE_TLS", false)
+	pprofAddr := envcfg.String("MYVPN_PPROF_ADDR", "")
+	wsHeadersRaw := envcfg.String("MYVPN_WS_HEADERS", "")
 
+	if *serverURL == "" {
+		log.Fatal("Server URL is required. Pass -server wss://... or set MYVPN_SERVER env var.")
+	}
 	if *keyFile == "" {
-		log.Fatal("Key file is required. Use -key flag")
+		log.Fatal("Key file is required. Pass -key /path/to/key or set MYVPN_KEY env var.")
 	}
 
 	keyData, err := os.ReadFile(*keyFile)
@@ -62,9 +84,9 @@ func main() {
 	}
 
 	// Парсим дополнительные заголовки рукопожатия (если заданы)
-	headers, err := parseHeaders(*extraHeaders)
+	headers, err := parseHeaders(wsHeadersRaw)
 	if err != nil {
-		log.Fatalf("Failed to parse -ws-headers: %v", err)
+		log.Fatalf("Failed to parse MYVPN_WS_HEADERS: %v", err)
 	}
 
 	vpnClient, err := client.NewVPNClient(client.VPNClientConfig{
@@ -72,9 +94,9 @@ func main() {
 		Key:                key,
 		ClientIP:           *clientIP,
 		Verbose:            *verbose,
-		AutoRoutes:         *autoRoutes,
+		AutoRoutes:         autoRoutes,
 		ExtraHeaders:       headers,
-		InsecureSkipVerify: *insecureTLS,
+		InsecureSkipVerify: insecureTLS,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create VPN client: %v", err)
@@ -83,10 +105,10 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	if *pprofAddr != "" {
+	if pprofAddr != "" {
 		go func() {
-			log.Printf("Starting pprof server on %s", *pprofAddr)
-			log.Println(http.ListenAndServe(*pprofAddr, nil))
+			log.Printf("Starting pprof server on %s", pprofAddr)
+			log.Println(http.ListenAndServe(pprofAddr, nil))
 		}()
 	}
 
