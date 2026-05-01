@@ -1,7 +1,19 @@
+//go:build linux
+
+// Command myvpn-server — VPN-сервер для Linux.
+//
+// Транспорт — WebSocket: HTTP-вебхук Yandex API Gateway (POST /ws) и/или
+// прямой WS-эндпоинт для локальной отладки. TUN использует
+// golang.zx2c4.com/wireguard/tun, NAT — iptables MASQUERADE.
+//
+// Конфигурация: основные параметры доступны как флагами, так и переменными
+// окружения. Редко меняемое — только через переменные окружения.
 package main
 
 import (
+	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -12,106 +24,160 @@ import (
 	"syscall"
 	"time"
 
+	"myvpn/internal/envcfg"
+	"myvpn/internal/transport"
 	"myvpn/server"
 )
 
+// shutdownTimeout — максимальное время на graceful shutdown.
+//
+// За это время сервер должен:
+//   - закрыть TUN (мгновенно);
+//   - отправить close-фреймы активным WS-клиентам и дождаться их закрытия;
+//   - завершить in-flight webhook'и от Yandex API Gateway;
+//   - откатить iptables/NAT.
+const shutdownTimeout = 10 * time.Second
+
 func main() {
 	var (
-		listenAddr   = flag.String("addr", ":8080", "Address to listen on")
-		keyFile      = flag.String("key", "", "Path to encryption key file (32 bytes). If not provided, a random key will be generated")
-		verbose      = flag.Bool("verbose", false, "Enable verbose logging (logs every packet)")
-		pprofAddr    = flag.String("pprof", ":6060", "Address for pprof HTTP server (empty to disable)")
-		metricsAddr  = flag.String("metrics", ":6061", "Address for metrics HTTP server (empty to disable)")
+		keyFile = flag.String("key", envcfg.String("MYVPN_KEY", ""),
+			"Path to encryption key file (32 bytes). If empty, a random key will be generated. Env: MYVPN_KEY.")
+		listenAddr = flag.String("listen", envcfg.String("MYVPN_LISTEN", ":8080"),
+			"Address to listen on (HTTP webhook + optional direct WS). Env: MYVPN_LISTEN.")
+		directWS = flag.Bool("direct-ws", envcfg.Bool("MYVPN_DIRECT_WS", false),
+			"Enable a local direct WebSocket endpoint (path from MYVPN_DIRECT_WS_PATH, default /ws-direct) for testing without API Gateway. Env: MYVPN_DIRECT_WS.")
+		verbose = flag.Bool("verbose", envcfg.Bool("MYVPN_VERBOSE", false),
+			"Enable verbose logging (logs every packet). Env: MYVPN_VERBOSE.")
 	)
 	flag.Parse()
 
-	// Загружаем или генерируем ключ
+	webhookPath := envcfg.String("MYVPN_WEBHOOK_PATH", "/ws")
+	directWSPath := ""
+	if *directWS {
+		directWSPath = envcfg.String("MYVPN_DIRECT_WS_PATH", "/ws-direct")
+	}
+	pprofAddr := envcfg.String("MYVPN_PPROF_ADDR", "")
+	disableYC := envcfg.Bool("MYVPN_DISABLE_YANDEX_API", false)
+	iamTokenFile := envcfg.String("MYVPN_IAM_TOKEN_FILE", "")
+	iamMetadataURL := envcfg.String("YC_METADATA_URL", transport.YCMetadataTokenURL)
+	yandexAPIBase := envcfg.String("YC_CONNECTIONS_API_URL", transport.YCDefaultConnectionsAPIBase)
+
+	if disableYC && directWSPath == "" {
+		log.Fatal("With MYVPN_DISABLE_YANDEX_API=true you must enable -direct-ws " +
+			"(otherwise the server has no way to talk to clients).")
+	}
+
 	key, err := loadOrGenerateKey(*keyFile)
 	if err != nil {
 		log.Fatalf("Failed to load/generate key: %v", err)
 	}
 
-	// Создаем сервер
-	srv, err := server.NewServer(*listenAddr, key, *verbose)
+	var pushClient *transport.YCPushClient
+	if !disableYC {
+		tokens, err := transport.LoadIAMTokenProvider(
+			iamTokenFile,
+			"", // -iam-token флаг убран; чувствительные значения только из env
+			"YC_IAM_TOKEN",
+			iamMetadataURL,
+		)
+		if err != nil {
+			log.Fatalf("Failed to set up IAM token provider: %v\n"+
+				"Hint: set YC_IAM_TOKEN env var, MYVPN_IAM_TOKEN_FILE env var, "+
+				"or run on a Yandex Cloud VM with a service account attached. "+
+				"For local testing without IAM, set MYVPN_DISABLE_YANDEX_API=true and pass -direct-ws.", err)
+		}
+		pushClient, err = transport.NewYCPushClient(transport.YCPushClientConfig{
+			BaseURL:       yandexAPIBase,
+			TokenProvider: tokens,
+		})
+		if err != nil {
+			log.Fatalf("Failed to create Yandex push client: %v", err)
+		}
+	}
+
+	srv, err := server.NewServer(server.ServerConfig{
+		Listen:       *listenAddr,
+		WebhookPath:  webhookPath,
+		DirectWSPath: directWSPath,
+		Key:          key,
+		Verbose:      *verbose,
+		PushClient:   pushClient,
+	})
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}
 
-	// Запускаем сервер
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 
-	// Запускаем pprof сервер если указан адрес
-	if *pprofAddr != "" {
+	if pprofAddr != "" {
 		go func() {
-			log.Printf("Starting pprof server on %s", *pprofAddr)
-			log.Println(http.ListenAndServe(*pprofAddr, nil))
+			log.Printf("Starting pprof server on %s", pprofAddr)
+			log.Println(http.ListenAndServe(pprofAddr, nil))
 		}()
 	}
 
-	// Запускаем метрики сервер если указан адрес
-	if *metricsAddr != "" {
-		go startMetricsServer(*metricsAddr)
-	}
-
-	// Обрабатываем сигналы для корректного завершения
-	sigChan := make(chan os.Signal, 1)
+	// Первый сигнал → graceful shutdown с таймаутом.
+	// Второй сигнал → форсированный выход.
+	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	log.Println("VPN server started. Press Ctrl+C to stop.")
+	log.Println("VPN server started. Press Ctrl+C to stop (twice to force quit).")
 	<-sigChan
+	log.Printf("Shutting down server (graceful timeout %s)...", shutdownTimeout)
 
-	log.Println("Shutting down server...")
-	if err := srv.Stop(); err != nil {
-		log.Printf("Error stopping server: %v", err)
+	go func() {
+		<-sigChan
+		log.Fatalf("Forced shutdown — exiting immediately")
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("Error during shutdown: %v", err)
 	}
 
 	log.Println("Server stopped.")
 }
 
-// loadOrGenerateKey загружает ключ из файла или генерирует новый
+// loadOrGenerateKey загружает ключ из файла или генерирует случайный.
+//
+// Принимаются те же два формата, что и у клиента: 32 байта бинарных данных
+// или 64 hex-символа. Без этой симметрии один и тот же key.bin не работал бы
+// одновременно на сервере и клиенте.
 func loadOrGenerateKey(keyFile string) ([]byte, error) {
-	const keySize = 32 // 32 байта для ChaCha20-Poly1305
+	const (
+		keySize    = 32
+		hexKeySize = 64
+	)
 
 	if keyFile != "" {
-		// Загружаем ключ из файла
-		key, err := os.ReadFile(keyFile)
+		data, err := os.ReadFile(keyFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read key file: %w", err)
+			return nil, fmt.Errorf("read key file: %w", err)
 		}
-
-		if len(key) != keySize {
-			return nil, fmt.Errorf("invalid key size: expected %d bytes, got %d", keySize, len(key))
+		switch len(data) {
+		case keySize:
+			return data, nil
+		case hexKeySize:
+			decoded, err := hex.DecodeString(string(data))
+			if err != nil {
+				return nil, fmt.Errorf("decode hex key: %w", err)
+			}
+			log.Println("Key file detected as hex format, converted to binary")
+			return decoded, nil
+		default:
+			return nil, fmt.Errorf("invalid key size: got %d, want %d (binary) or %d (hex)",
+				len(data), keySize, hexKeySize)
 		}
-
-		return key, nil
 	}
 
-	// Генерируем случайный ключ
 	key := make([]byte, keySize)
 	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("failed to generate key: %w", err)
+		return nil, fmt.Errorf("generate random key: %w", err)
 	}
-
-	log.Println("Generated random encryption key. Save it for client configuration!")
-	log.Printf("Key (hex): %x\n", key)
-
+	log.Printf("Generated random key. Hex: %x", key)
+	log.Println("Save this key and pass it to clients via -key (binary) or set MYVPN_KEY.")
 	return key, nil
-}
-
-// startMetricsServer запускает HTTP сервер для метрик
-func startMetricsServer(addr string) {
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintf(w, "# VPN Server Metrics\n")
-		fmt.Fprintf(w, "# Time: %s\n\n", time.Now().Format(time.RFC3339))
-		// Здесь можно добавить экспорт метрик в формате Prometheus или просто текстовый формат
-		fmt.Fprintf(w, "metrics_endpoint_active 1\n")
-	})
-
-	log.Printf("Starting metrics server on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Printf("Metrics server error: %v", err)
-	}
 }

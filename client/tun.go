@@ -1,141 +1,100 @@
 package client
 
 import (
+	"errors"
 	"fmt"
-	"os"
-	"os/exec"
-	"syscall"
-	"unsafe"
+	"io"
 
-	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/tun"
+
 	"myvpn/internal"
 )
 
-const (
-	// TUNInterfaceName имя TUN интерфейса на клиенте
-	TUNInterfaceName = "myvpn0"
-)
+// TUNInterfaceName имя TUN-интерфейса по умолчанию.
+//
+// На Linux это будет имя устройства в /sys/class/net/, на Windows — имя
+// Wintun-адаптера, видимое в "Network Connections".
+const TUNInterfaceName = "myvpn0"
 
-// TUN представляет TUN интерфейс на клиенте
+// TUN — кросс-платформенная обёртка над tun.Device из библиотеки WireGuard.
+//
+// Внутри использует:
+//   - на Linux: /dev/net/tun (стандартный механизм TUN/TAP);
+//   - на Windows: драйвер Wintun (требуется wintun.dll).
+//
+// Снаружи предоставляет привычный пакетно-ориентированный Read/Write API
+// без батчинга — батчинг WireGuard-а здесь не нужен, потому что трафик
+// далее уходит в один WebSocket.
 type TUN struct {
-	file *os.File
+	dev  tun.Device
 	name string
 }
 
-// NewTUN создает новый TUN интерфейс на клиенте
-func NewTUN(name string, clientIP string) (*TUN, error) {
-	// Открываем файл устройства TUN
-	file, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+// NewTUN создаёт TUN-интерфейс с заданным именем и IP/маской.
+//
+// Под Linux требуется CAP_NET_ADMIN (обычно — root). Под Windows требуется
+// административный доступ и wintun.dll, лежащая рядом с .exe или в System32.
+func NewTUN(name, clientIP string) (*TUN, error) {
+	if name == "" {
+		name = TUNInterfaceName
+	}
+	dev, err := tun.CreateTUN(name, internal.TUNMTU)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open TUN device: %w", err)
+		return nil, fmt.Errorf("create TUN %q: %w", name, err)
 	}
 
-	// Настраиваем TUN интерфейс
-	ifreq, err := createInterfaceRequest(name)
+	// На Linux имя могло быть изменено ядром (например при коллизии).
+	actualName, err := dev.Name()
 	if err != nil {
-		file.Close()
-		return nil, err
+		_ = dev.Close()
+		return nil, fmt.Errorf("get TUN name: %w", err)
 	}
 
-	// Выполняем ioctl для создания интерфейса
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		file.Fd(),
-		uintptr(unix.TUNSETIFF),
-		uintptr(unsafe.Pointer(&ifreq[0])),
-	)
-
-	if errno != 0 {
-		file.Close()
-		return nil, fmt.Errorf("failed to create TUN interface: %v", errno)
+	if err := configureInterface(actualName, clientIP); err != nil {
+		_ = dev.Close()
+		return nil, fmt.Errorf("configure %q: %w", actualName, err)
 	}
 
-	// Получаем реальное имя интерфейса
-	actualName := getInterfaceName(ifreq)
-
-	tun := &TUN{
-		file: file,
-		name: actualName,
-	}
-
-	// Настраиваем интерфейс
-	if err := tun.setup(clientIP); err != nil {
-		tun.Close()
-		return nil, fmt.Errorf("failed to setup TUN interface: %w", err)
-	}
-
-	return tun, nil
+	return &TUN{dev: dev, name: actualName}, nil
 }
 
-// createInterfaceRequest создает структуру ifreq для ioctl
-func createInterfaceRequest(name string) ([unix.IFNAMSIZ + 64]byte, error) {
-	var ifr [unix.IFNAMSIZ + 64]byte
-	copy(ifr[:], name)
-	// Устанавливаем флаг IFF_TUN (без IFF_NO_PI для получения чистых IP пакетов)
-	*(*uint16)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) = unix.IFF_TUN | unix.IFF_NO_PI
-	return ifr, nil
-}
-
-// getInterfaceName извлекает имя интерфейса из ifreq
-func getInterfaceName(ifr [unix.IFNAMSIZ + 64]byte) string {
-	// Имя интерфейса находится в первых IFNAMSIZ байтах
-	name := make([]byte, 0, unix.IFNAMSIZ)
-	for i := 0; i < unix.IFNAMSIZ; i++ {
-		if ifr[i] == 0 {
-			break
+// Read читает один IP-пакет из TUN-интерфейса. Блокируется до появления
+// данных или закрытия. После Close возвращает io.EOF.
+func (t *TUN) Read(buf []byte) (int, error) {
+	bufs := [][]byte{buf}
+	sizes := []int{0}
+	n, err := t.dev.Read(bufs, sizes, 0)
+	if err != nil {
+		if errors.Is(err, tun.ErrTooManySegments) {
+			return 0, fmt.Errorf("tun read: %w", err)
 		}
-		name = append(name, ifr[i])
+		// На закрытии Wintun возвращает специфические ошибки, нам они не важны
+		// — сводим к io.EOF, чтобы клиент аккуратно завершил работу.
+		if isClosedErr(err) {
+			return 0, io.EOF
+		}
+		return 0, err
 	}
-	return string(name)
+	if n == 0 {
+		return 0, nil
+	}
+	return sizes[0], nil
 }
 
-// setup настраивает TUN интерфейс (IP адрес, MTU, поднимает интерфейс)
-func (t *TUN) setup(clientIP string) error {
-	// Настраиваем IP адрес интерфейса
-	cmd := exec.Command("ip", "addr", "add", clientIP+"/24", "dev", t.name)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to set IP address: %w", err)
-	}
-
-	// Устанавливаем MTU
-	cmd = exec.Command("ip", "link", "set", "dev", t.name, "mtu", fmt.Sprintf("%d", internal.TUNMTU))
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to set MTU: %w", err)
-	}
-
-	// Поднимаем интерфейс
-	cmd = exec.Command("ip", "link", "set", "dev", t.name, "up")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to bring interface up: %w", err)
-	}
-
-	return nil
-}
-
-// Read читает IP пакет из TUN интерфейса
-func (t *TUN) Read(packet []byte) (int, error) {
-	return t.file.Read(packet)
-}
-
-// Write записывает IP пакет в TUN интерфейс
+// Write отправляет один IP-пакет в TUN-интерфейс.
 func (t *TUN) Write(packet []byte) (int, error) {
-	return t.file.Write(packet)
-}
-
-// Name возвращает имя интерфейса
-func (t *TUN) Name() string {
-	return t.name
-}
-
-// Close закрывает TUN интерфейс
-func (t *TUN) Close() error {
-	if t.file != nil {
-		return t.file.Close()
+	if len(packet) == 0 {
+		return 0, nil
 	}
-	return nil
+	bufs := [][]byte{packet}
+	if _, err := t.dev.Write(bufs, 0); err != nil {
+		return 0, err
+	}
+	return len(packet), nil
 }
 
-// File возвращает файловый дескриптор для использования в select/poll
-func (t *TUN) File() *os.File {
-	return t.file
-}
+// Name возвращает фактическое имя интерфейса.
+func (t *TUN) Name() string { return t.name }
+
+// Close закрывает TUN-интерфейс и освобождает связанные ресурсы.
+func (t *TUN) Close() error { return t.dev.Close() }
