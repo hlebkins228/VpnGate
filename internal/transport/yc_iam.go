@@ -62,8 +62,8 @@ type FileIAMToken struct {
 	path     string
 	interval time.Duration
 
-	mu      sync.RWMutex
-	token   string
+	mu       sync.RWMutex
+	token    string
 	loadedAt time.Time
 }
 

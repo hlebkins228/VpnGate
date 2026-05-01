@@ -16,14 +16,14 @@ import (
 
 func main() {
 	var (
-		serverURL          = flag.String("server", "", "VPN server WebSocket URL (e.g., wss://d5d...apigw.yandexcloud.net/ws)")
-		keyFile            = flag.String("key", "", "Path to encryption key file (32 bytes binary or 64 hex chars)")
-		clientIP           = flag.String("ip", "10.0.0.2", "Client IP address for TUN interface")
-		verbose            = flag.Bool("verbose", false, "Enable verbose logging (logs every packet)")
-		pprofAddr          = flag.String("pprof", ":6060", "Address for pprof HTTP server (empty to disable)")
-		autoRoutes         = flag.Bool("auto-routes", true, "Automatically configure routes (redirect all traffic through VPN)")
-		insecureTLS        = flag.Bool("insecure-tls", false, "Skip TLS certificate verification (debug only)")
-		extraHeaders       = flag.String("ws-headers", "", "Comma-separated extra WebSocket handshake headers in 'Key: Value' form")
+		serverURL    = flag.String("server", "", "VPN server WebSocket URL (e.g., wss://d5d...apigw.yandexcloud.net/ws)")
+		keyFile      = flag.String("key", "", "Path to encryption key file (32 bytes binary or 64 hex chars)")
+		clientIP     = flag.String("ip", "10.0.0.2", "Client IP address for TUN interface")
+		verbose      = flag.Bool("verbose", false, "Enable verbose logging (logs every packet)")
+		pprofAddr    = flag.String("pprof", ":6060", "Address for pprof HTTP server (empty to disable)")
+		autoRoutes   = flag.Bool("auto-routes", true, "Automatically configure routes (redirect all traffic through VPN)")
+		insecureTLS  = flag.Bool("insecure-tls", false, "Skip TLS certificate verification (debug only)")
+		extraHeaders = flag.String("ws-headers", "", "Comma-separated extra WebSocket handshake headers in 'Key: Value' form")
 	)
 	flag.Parse()
 

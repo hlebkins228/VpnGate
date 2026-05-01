@@ -349,5 +349,3 @@ func (s *Server) Stop() error {
 
 	return nil
 }
-
-

@@ -61,9 +61,9 @@ type WSClientTransport struct {
 
 	writeMu sync.Mutex // сериализует запись в conn (gorilla требует один writer)
 
-	done   chan struct{}
-	wg     sync.WaitGroup
-	closed bool
+	done    chan struct{}
+	wg      sync.WaitGroup
+	closed  bool
 	closeMu sync.Mutex
 }
 

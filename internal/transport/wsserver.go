@@ -18,9 +18,9 @@ import (
 // Yandex API Gateway добавляет в HTTP-запрос интеграции набор заголовков,
 // описанный в https://yandex.cloud/ru/docs/api-gateway/concepts/extensions/websocket
 const (
-	HeaderConnectionID = "X-Yc-Apigateway-Websocket-Connection-Id"
-	HeaderEventType    = "X-Yc-Apigateway-Websocket-Event-Type"
-	HeaderConnectedAt  = "X-Yc-Apigateway-Websocket-Connected-At"
+	HeaderConnectionID     = "X-Yc-Apigateway-Websocket-Connection-Id"
+	HeaderEventType        = "X-Yc-Apigateway-Websocket-Event-Type"
+	HeaderConnectedAt      = "X-Yc-Apigateway-Websocket-Connected-At"
 	HeaderDisconnectStatus = "X-Yc-Apigateway-Websocket-Disconnect-Status-Code"
 	HeaderDisconnectReason = "X-Yc-Apigateway-Websocket-Disconnect-Reason"
 
@@ -122,7 +122,7 @@ type WSServerConfig struct {
 type WSServerTransport struct {
 	cfg WSServerConfig
 
-	httpSrv *http.Server
+	httpSrv  *http.Server
 	listener net.Listener
 	upgrader websocket.Upgrader
 
