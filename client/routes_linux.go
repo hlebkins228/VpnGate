@@ -45,7 +45,16 @@ func (rm *RouteManager) SetupRoutes() error {
 		return fmt.Errorf("read default route: %w", err)
 	}
 
-	serverRoute := fmt.Sprintf("%s via %s dev %s", rm.serverIP, rm.oldGateway, rm.oldInterface)
+	// На обычных Ethernet/Wi-Fi default-маршрут идёт через шлюз ("via"), но
+	// бывают и point-to-point интерфейсы (PPP, WireGuard поверх существующего
+	// VPN), где default — просто "dev <iface>" без шлюза. Симметрично с
+	// RestoreRoutes собираем команду в зависимости от наличия шлюза.
+	var serverRoute string
+	if rm.oldGateway != "" {
+		serverRoute = fmt.Sprintf("%s via %s dev %s", rm.serverIP, rm.oldGateway, rm.oldInterface)
+	} else {
+		serverRoute = fmt.Sprintf("%s dev %s", rm.serverIP, rm.oldInterface)
+	}
 	if err := rm.addRoute(serverRoute); err != nil {
 		return fmt.Errorf("add server route: %w", err)
 	}
