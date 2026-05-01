@@ -31,7 +31,7 @@ buildGoModule {
 
   subPackages = selectedSubPackages;
 
-  vendorHash = "sha256-1fBJpb7SoW8lb/JXr01NvUwBq0lhrvSp+utI5MgVP98=";
+  vendorHash = "sha256-FIkq31fS13+da48usCSWXnYk75DulrohZDuNXENNEf0=";
 
   ldflags = [ "-s" ];
 

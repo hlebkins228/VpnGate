@@ -4,49 +4,83 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"net/url"
+	"strings"
 	"sync"
-	"time"
+
 	"myvpn/internal"
 	"myvpn/internal/compress"
 	"myvpn/internal/transport"
 )
 
-// VPNClient
+// VPNClient — VPN-клиент, использующий WebSocket-транспорт до Yandex API Gateway.
 type VPNClient struct {
-	serverAddr   string
+	serverURL    string
 	tun          *TUN
 	crypto       *internal.Crypto
 	protocol     *internal.Protocol
-	transport    *transport.UDPTransport
+	transport    *transport.WSClientTransport
 	routeManager *RouteManager
 	done         chan struct{}
 	wg           sync.WaitGroup
 	verbose      bool
 	autoRoutes   bool
+
+	// extraHeaders дополнительные HTTP заголовки для рукопожатия (опционально)
+	extraHeaders http.Header
+	// insecureSkipVerify отключает проверку TLS сертификата (для отладки)
+	insecureSkipVerify bool
 }
 
-// NewVPNClient создает новый VPN клиент
-func NewVPNClient(serverAddr string, key []byte, clientIP string, verbose bool, autoRoutes bool) (*VPNClient, error) {
+// VPNClientConfig параметры VPN клиента.
+type VPNClientConfig struct {
+	// ServerURL WebSocket URL (wss://... или ws://...) Yandex API Gateway или
+	// прямого WS-эндпоинта VPN-сервера.
+	ServerURL string
+	// Key 32-байтный ключ ChaCha20-Poly1305.
+	Key []byte
+	// ClientIP IP-адрес для TUN-интерфейса клиента (например 10.0.0.2).
+	ClientIP string
+	// Verbose подробное логирование.
+	Verbose bool
+	// AutoRoutes автоматическая настройка маршрутов всего трафика через VPN.
+	AutoRoutes bool
+	// ExtraHeaders дополнительные заголовки рукопожатия (опционально).
+	ExtraHeaders http.Header
+	// InsecureSkipVerify отключает проверку TLS-сертификата (только для отладки).
+	InsecureSkipVerify bool
+}
+
+// NewVPNClient создаёт новый VPN клиент.
+func NewVPNClient(cfg VPNClientConfig) (*VPNClient, error) {
+	if cfg.ServerURL == "" {
+		return nil, fmt.Errorf("server URL is required")
+	}
+
 	// Создаем TUN интерфейс
-	tun, err := NewTUN(TUNInterfaceName, clientIP)
+	tun, err := NewTUN(TUNInterfaceName, cfg.ClientIP)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TUN interface: %w", err)
 	}
 
-	// применяем шифрование
-	crypto, err := internal.NewCrypto(key)
+	crypto, err := internal.NewCrypto(cfg.Key)
 	if err != nil {
 		tun.Close()
 		return nil, fmt.Errorf("failed to create crypto: %w", err)
 	}
 
-	// Инициализируем протокол
 	protocol := internal.NewProtocol(crypto)
 
 	// Создаем менеджер маршрутов только если включена автоматическая настройка
 	var routeManager *RouteManager
-	if autoRoutes {
-		routeManager, err = NewRouteManager(TUNInterfaceName, serverAddr)
+	if cfg.AutoRoutes {
+		host, err := extractServerHost(cfg.ServerURL)
+		if err != nil {
+			tun.Close()
+			return nil, fmt.Errorf("failed to extract server host from %q: %w", cfg.ServerURL, err)
+		}
+		routeManager, err = NewRouteManager(TUNInterfaceName, host)
 		if err != nil {
 			tun.Close()
 			return nil, fmt.Errorf("failed to create route manager: %w", err)
@@ -54,27 +88,32 @@ func NewVPNClient(serverAddr string, key []byte, clientIP string, verbose bool, 
 	}
 
 	return &VPNClient{
-		serverAddr:   serverAddr,
-		tun:          tun,
-		crypto:       crypto,
-		protocol:     protocol,
-		routeManager: routeManager,
-		done:         make(chan struct{}),
-		verbose:      verbose,
-		autoRoutes:   autoRoutes,
+		serverURL:          cfg.ServerURL,
+		tun:                tun,
+		crypto:             crypto,
+		protocol:           protocol,
+		routeManager:       routeManager,
+		done:               make(chan struct{}),
+		verbose:            cfg.Verbose,
+		autoRoutes:         cfg.AutoRoutes,
+		extraHeaders:       cfg.ExtraHeaders,
+		insecureSkipVerify: cfg.InsecureSkipVerify,
 	}, nil
 }
 
-// Connect подключается к VPN серверу и начинает обмен пакетами
+// Connect подключается к VPN серверу через WebSocket и начинает обмен пакетами.
 func (c *VPNClient) Connect() error {
-	// Создаем UDP транспорт
-	udpTransport, err := transport.NewUDPTransport(":0", c.serverAddr, 30*time.Second)
+	wsTransport, err := transport.NewWSClientTransport(transport.WSClientConfig{
+		URL:                c.serverURL,
+		Headers:            c.extraHeaders,
+		InsecureSkipVerify: c.insecureSkipVerify,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create UDP transport: %w", err)
+		return fmt.Errorf("failed to create WebSocket transport: %w", err)
 	}
 
-	c.transport = udpTransport
-	log.Printf("Connected to VPN server at %s", c.serverAddr)
+	c.transport = wsTransport
+	log.Printf("Connected to VPN server at %s", c.serverURL)
 	log.Printf("TUN interface: %s", c.tun.Name())
 
 	// Настраиваем маршрутизацию всего трафика через VPN
@@ -87,22 +126,19 @@ func (c *VPNClient) Connect() error {
 		}
 	}
 
-	// Запускаем горутину для чтения из TUN и отправки на сервер
 	c.wg.Add(1)
 	go c.handleTunToServer()
 
-	// Запускаем горутину для чтения от сервера и записи в TUN
 	c.wg.Add(1)
 	go c.handleServerToTun()
 
-	// Ждем завершения
 	c.wg.Wait()
 	log.Println("Disconnected from VPN server")
 
 	return nil
 }
 
-// handleTunToServer читает пакеты из TUN и отправляет на сервер
+// handleTunToServer читает пакеты из TUN и отправляет на сервер.
 func (c *VPNClient) handleTunToServer() {
 	defer c.wg.Done()
 
@@ -116,10 +152,6 @@ func (c *VPNClient) handleTunToServer() {
 		default:
 		}
 
-		// Устанавливаем deadline для возможности прерывания
-		// Используем SetReadDeadline через файловый дескриптор TUN
-		// Для TUN интерфейса используем прямое чтение с проверкой done канала
-		// через неблокирующее чтение
 		n, err := c.tun.Read(packet)
 		if err != nil {
 			select {
@@ -140,8 +172,7 @@ func (c *VPNClient) handleTunToServer() {
 			if c.verbose {
 				log.Printf("Read %d bytes from TUN, sending to server", n)
 			}
-			// Отправляем пакет на сервер через UDP транспорт
-			if err := c.sendPacketUDP(packet[:n]); err != nil {
+			if err := c.sendPacket(packet[:n]); err != nil {
 				log.Printf("Error sending packet to server: %v", err)
 				c.Close()
 				return
@@ -150,22 +181,23 @@ func (c *VPNClient) handleTunToServer() {
 	}
 }
 
-// sendPacketUDP отправляет пакет через UDP транспорт
-func (c *VPNClient) sendPacketUDP(packet []byte) error {
-	// Сжимаем пакет (опционально)
+// sendPacket сжимает, шифрует и отправляет пакет через WebSocket.
+//
+// Формат отправляемого WebSocket сообщения:
+//
+//	[флаг сжатия (1 байт)] [nonce (12 байт)] [ciphertext + tag (n байт)]
+func (c *VPNClient) sendPacket(packet []byte) error {
 	compressed, isCompressed, err := compress.Compress(packet)
 	if err != nil {
 		return fmt.Errorf("compression failed: %w", err)
 	}
 
-	// Шифруем пакет
 	encrypted, err := c.crypto.Encrypt(compressed)
 	if err != nil {
 		return err
 	}
 
-	// Добавляем флаг сжатия в начало зашифрованных данных
-	// Используем первый байт для флагов (бит 0 = сжатие)
+	// Префиксируем 1 байтом флагов (бит 0 — сжатие)
 	result := make([]byte, 1+len(encrypted))
 	if isCompressed {
 		result[0] = internal.FlagCompressed
@@ -174,24 +206,21 @@ func (c *VPNClient) sendPacketUDP(packet []byte) error {
 	}
 	copy(result[1:], encrypted)
 
-	// Проверяем размер после всех преобразований (шифрование + флаг сжатия)
-	// MaxPacketSize в транспорте - это размер до добавления UDP заголовка транспорта
-	if len(result) > transport.MaxPacketSize {
-		return fmt.Errorf("packet too large after encryption: %d bytes (max %d), original: %d bytes", len(result), transport.MaxPacketSize, len(packet))
+	if len(result) > transport.WSMaxMessageSize {
+		return fmt.Errorf("packet too large after encryption: %d bytes (max %d), original: %d bytes",
+			len(result), transport.WSMaxMessageSize, len(packet))
 	}
 
-	// Отправляем через UDP транспорт
 	_, err = c.transport.Write(result)
 	return err
 }
 
-// handleServerToTun читает пакеты от сервера и записывает в TUN
+// handleServerToTun читает пакеты от сервера и записывает в TUN.
 func (c *VPNClient) handleServerToTun() {
 	defer c.wg.Done()
 
-	// Буфер должен быть достаточного размера для данных после шифрования + флаг сжатия
-	// MaxPacketSize в транспорте = 1467 байт (это максимальный размер данных без UDP заголовка)
-	buf := make([]byte, transport.MaxPacketSize)
+	// WebSocket сообщение целиком приходит в буфер. Делаем буфер с запасом.
+	buf := make([]byte, transport.WSMaxMessageSize)
 
 	for {
 		select {
@@ -199,66 +228,60 @@ func (c *VPNClient) handleServerToTun() {
 			log.Println("handleServerToTun: done signal received")
 			return
 		default:
-			// Читаем из UDP транспорта
-			n, err := c.transport.Read(buf)
-			if err != nil {
-				select {
-				case <-c.done:
-					return
-				default:
-					log.Printf("Error receiving packet from server: %v", err)
-					c.Close()
-					return
-				}
+		}
+
+		n, err := c.transport.Read(buf)
+		if err != nil {
+			select {
+			case <-c.done:
+				return
+			default:
+				log.Printf("Error receiving packet from server: %v", err)
+				c.Close()
+				return
 			}
+		}
 
-			if n > 0 {
-				if n < 1 {
-					continue
-				}
+		if n < 1 {
+			continue
+		}
 
-				// Извлекаем флаг сжатия
-				flags := buf[0]
-				isCompressed := (flags & internal.FlagCompressed) != 0
+		// Извлекаем флаг сжатия
+		flags := buf[0]
+		isCompressed := (flags & internal.FlagCompressed) != 0
 
-				// Дешифруем пакет
-				encrypted := buf[1:n]
-				packet, err := c.crypto.Decrypt(encrypted)
-				if err != nil {
-					log.Printf("Error decrypting packet: %v", err)
-					continue
-				}
+		encrypted := buf[1:n]
+		packet, err := c.crypto.Decrypt(encrypted)
+		if err != nil {
+			log.Printf("Error decrypting packet: %v", err)
+			continue
+		}
 
-				// Распаковываем если нужно
-				if isCompressed {
-					packet, err = compress.Decompress(packet, true)
-					if err != nil {
-						log.Printf("Error decompressing packet: %v", err)
-						continue
-					}
-				}
+		if isCompressed {
+			packet, err = compress.Decompress(packet, true)
+			if err != nil {
+				log.Printf("Error decompressing packet: %v", err)
+				continue
+			}
+		}
 
-				if len(packet) > 0 {
-					if c.verbose {
-						log.Printf("Received %d bytes from server, writing to TUN", len(packet))
-					}
-					// Записываем пакет в TUN
-					if _, err := c.tun.Write(packet); err != nil {
-						log.Printf("Error writing packet to TUN: %v", err)
-						c.Close()
-						return
-					}
-				}
+		if len(packet) > 0 {
+			if c.verbose {
+				log.Printf("Received %d bytes from server, writing to TUN", len(packet))
+			}
+			if _, err := c.tun.Write(packet); err != nil {
+				log.Printf("Error writing packet to TUN: %v", err)
+				c.Close()
+				return
 			}
 		}
 	}
 }
 
-// Close закрывает соединение и TUN интерфейс
+// Close закрывает соединение и TUN интерфейс.
 func (c *VPNClient) Close() error {
 	select {
 	case <-c.done:
-		// Уже закрыто
 		return nil
 	default:
 		close(c.done)
@@ -293,4 +316,21 @@ func (c *VPNClient) Close() error {
 	}
 
 	return nil
+}
+
+// extractServerHost извлекает hostname из WebSocket URL для добавления маршрута.
+//
+// Возвращает либо доменное имя, либо IP-литерал.
+func extractServerHost(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("URL has no host: %q", rawURL)
+	}
+	// На всякий случай отбрасываем порт и trailing slashes
+	host = strings.TrimSpace(host)
+	return host, nil
 }
