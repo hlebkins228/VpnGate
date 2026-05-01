@@ -271,19 +271,21 @@ func (t *WSServerTransport) Close() error {
 // Shutdown — graceful-завершение транспорта.
 //
 // Порядок:
-//  1. Сигнализируем горутинам остановиться (close(done)).
+//  1. Сигнализируем горутинам остановиться (close(done)). После этого все
+//     писатели в t.incoming в своих select'ах увидят сигнал и выйдут, не
+//     записав ничего нового.
 //  2. Отправляем close-фрейм всем активным WebSocket-клиентам и закрываем
-//     их sink'и.
+//     их sink'и — это разблокирует ReadMessage в handleDirectWS.
 //  3. http.Server.Shutdown(ctx) — даёт in-flight webhook'ам завершиться;
 //     одновременно прерывает Serve.
 //  4. Ждём окончания всех goroutine, привязанных к транспорту (Serve и
-//     handleDirectWS), с учётом ctx.
-//  5. Закрываем канал incoming.
+//     handleDirectWS), но не дольше ctx.
 //
-// Если ctx истекает раньше чем горутины успели завершиться, мы всё равно
-// продолжаем последовательность: Close() listener'а / sink'ов уже произошёл,
-// поэтому на горутины давление есть, и в большинстве случаев они выйдут
-// почти сразу после возврата Shutdown.
+// Если ctx истекает раньше — возвращаемся, не блокируясь дополнительно.
+// Канал t.incoming намеренно НЕ закрывается: Recv уже разблокирован через
+// select на t.done, а оставлять канал «висящим» безопаснее, чем рисковать
+// «send on closed channel» если какой-то writer ещё не успел отрисоваться.
+// Канал освободит GC, когда транспорт станет недостижим.
 func (t *WSServerTransport) Shutdown(ctx context.Context) error {
 	t.closeMu.Lock()
 	if t.closed {
@@ -319,15 +321,15 @@ func (t *WSServerTransport) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-doneCh:
+		return nil
 	case <-ctx.Done():
-		// Ускоряем выход goroutine direct WS — listener уже закрыт Shutdown'ом,
-		// соединения тоже. Подождём ещё немного, чтобы избежать гонки на
-		// записи в incoming.
-		<-doneCh
+		// Не блокируемся бесконечно. Все писатели в incoming заворачивают
+		// send в select на t.done, и t.done закрыт — значит они либо уже
+		// вышли, либо не дойдут до записи в incoming. Поэтому корректно
+		// вернуть управление, даже если какие-то goroutine ещё не отдрайнились.
+		log.Printf("ws transport: shutdown deadline exceeded, returning anyway")
+		return ctx.Err()
 	}
-
-	close(t.incoming)
-	return nil
 }
 
 // handleWebhook обрабатывает HTTP-вебхук от Yandex API Gateway.

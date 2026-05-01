@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -141,18 +142,35 @@ func main() {
 }
 
 // loadOrGenerateKey загружает ключ из файла или генерирует случайный.
+//
+// Принимаются те же два формата, что и у клиента: 32 байта бинарных данных
+// или 64 hex-символа. Без этой симметрии один и тот же key.bin не работал бы
+// одновременно на сервере и клиенте.
 func loadOrGenerateKey(keyFile string) ([]byte, error) {
-	const keySize = 32
+	const (
+		keySize    = 32
+		hexKeySize = 64
+	)
 
 	if keyFile != "" {
-		key, err := os.ReadFile(keyFile)
+		data, err := os.ReadFile(keyFile)
 		if err != nil {
 			return nil, fmt.Errorf("read key file: %w", err)
 		}
-		if len(key) != keySize {
-			return nil, fmt.Errorf("invalid key size: got %d, want %d", len(key), keySize)
+		switch len(data) {
+		case keySize:
+			return data, nil
+		case hexKeySize:
+			decoded, err := hex.DecodeString(string(data))
+			if err != nil {
+				return nil, fmt.Errorf("decode hex key: %w", err)
+			}
+			log.Println("Key file detected as hex format, converted to binary")
+			return decoded, nil
+		default:
+			return nil, fmt.Errorf("invalid key size: got %d, want %d (binary) or %d (hex)",
+				len(data), keySize, hexKeySize)
 		}
-		return key, nil
 	}
 
 	key := make([]byte, keySize)
