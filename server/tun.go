@@ -22,9 +22,16 @@ const TUNInterfaceName = "myvpn0"
 // На Linux использует /dev/net/tun (тот же путь, что и любой другой VPN-софт),
 // но без ручных ioctl: вся низкоуровневая работа делегирована
 // golang.zx2c4.com/wireguard/tun.
+//
+// rdScratch и wrScratch — внутренние буферы с резервом internal.TUNOffset
+// байт перед пакетом. Это требование tun.Device на Linux (см. TUNOffset).
+// Read/Write сериализуются на уровне вызывающей логики (по одной горутине
+// на направление), поэтому защищать буферы мьютексом не нужно.
 type TUN struct {
-	dev  tun.Device
-	name string
+	dev      tun.Device
+	name     string
+	rdScratch []byte
+	wrScratch []byte
 }
 
 // NewTUN создаёт TUN-интерфейс с заданным именем и поднимает его с адресом
@@ -49,14 +56,19 @@ func NewTUN(name string) (*TUN, error) {
 		return nil, fmt.Errorf("setup %q: %w", actualName, err)
 	}
 
-	return &TUN{dev: dev, name: actualName}, nil
+	return &TUN{
+		dev:       dev,
+		name:      actualName,
+		rdScratch: make([]byte, internal.TUNOffset+internal.TUNMTU),
+		wrScratch: make([]byte, internal.TUNOffset+internal.TUNMTU),
+	}, nil
 }
 
 // Read читает один IP-пакет.
 func (t *TUN) Read(buf []byte) (int, error) {
-	bufs := [][]byte{buf}
+	bufs := [][]byte{t.rdScratch}
 	sizes := []int{0}
-	n, err := t.dev.Read(bufs, sizes, 0)
+	n, err := t.dev.Read(bufs, sizes, internal.TUNOffset)
 	if err != nil {
 		// При закрытии возвращаем io.EOF, чтобы цикл чтения вышел тихо.
 		if errors.Is(err, fs.ErrClosed) {
@@ -67,7 +79,12 @@ func (t *TUN) Read(buf []byte) (int, error) {
 	if n == 0 {
 		return 0, nil
 	}
-	return sizes[0], nil
+	size := sizes[0]
+	if size > len(buf) {
+		return 0, fmt.Errorf("packet of %d bytes does not fit into %d-byte buffer", size, len(buf))
+	}
+	copy(buf, t.rdScratch[internal.TUNOffset:internal.TUNOffset+size])
+	return size, nil
 }
 
 // Write отправляет один IP-пакет.
@@ -75,8 +92,20 @@ func (t *TUN) Write(packet []byte) (int, error) {
 	if len(packet) == 0 {
 		return 0, nil
 	}
-	bufs := [][]byte{packet}
-	if _, err := t.dev.Write(bufs, 0); err != nil {
+	need := internal.TUNOffset + len(packet)
+	if cap(t.wrScratch) < need {
+		t.wrScratch = make([]byte, need)
+	} else {
+		t.wrScratch = t.wrScratch[:need]
+	}
+	// Обнуляем зону virtio_net_hdr, чтобы в неё не попадали остатки от
+	// предыдущих записей разной длины.
+	for i := 0; i < internal.TUNOffset; i++ {
+		t.wrScratch[i] = 0
+	}
+	copy(t.wrScratch[internal.TUNOffset:], packet)
+	bufs := [][]byte{t.wrScratch}
+	if _, err := t.dev.Write(bufs, internal.TUNOffset); err != nil {
 		return 0, err
 	}
 	return len(packet), nil
