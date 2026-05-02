@@ -12,7 +12,8 @@ import (
 )
 
 // configureInterface назначает Linux-TUN адресу маску /24, ставит MTU и поднимает интерфейс.
-func configureInterface(name, clientIP string) error {
+func configureInterface(t *TUN, clientIP string) error {
+	name := t.name
 	if err := runIP("addr", "add", clientIP+"/24", "dev", name); err != nil {
 		return fmt.Errorf("set IP %s: %w", clientIP, err)
 	}

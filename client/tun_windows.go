@@ -5,44 +5,74 @@ package client
 import (
 	"errors"
 	"fmt"
-	"log"
-	"os/exec"
-	"strings"
+	"net/netip"
 
 	"golang.org/x/sys/windows"
+	wgtun "golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 
 	"myvpn/internal"
 )
 
-// configureInterface настраивает IP-адрес и MTU Wintun-адаптера через netsh.
-func configureInterface(name, clientIP string) error {
-	if err := runNetsh(
-		"interface", "ipv4", "set", "address",
-		fmt.Sprintf("name=%s", name),
-		"static", clientIP, "255.255.255.0",
-	); err != nil {
-		return fmt.Errorf("set IP %s: %w", clientIP, err)
+// configureInterface назначает Wintun-адаптеру IP и MTU через WinAPI
+// (winipcfg). Подход тот же, что использует сам WireGuard: никаких
+// внешних команд (netsh / route.exe) — все вызовы через GetIpInterfaceEntry,
+// SetIpInterfaceEntry и CreateUnicastIpAddressEntry.
+//
+// Если netsh не успел "увидеть" свежесозданный Wintun-адаптер (бывает,
+// драйвер ещё не до конца поднял интерфейс), то старая реализация молча
+// возвращала "OK" и трафик не ходил. WinAPI делает это синхронно через LUID.
+func configureInterface(t *TUN, clientIP string) error {
+	luid := t.winLUID()
+	if luid == 0 {
+		return errors.New("could not obtain Wintun adapter LUID")
 	}
-	if err := runNetsh(
-		"interface", "ipv4", "set", "subinterface",
-		name,
-		fmt.Sprintf("mtu=%d", internal.TUNMTU),
-		"store=active",
-	); err != nil {
-		// MTU не критичен — логируем, но не падаем.
-		log.Printf("warning: failed to set MTU on %s: %v", name, err)
+
+	addr, err := netip.ParseAddr(clientIP)
+	if err != nil {
+		return fmt.Errorf("parse client IP %q: %w", clientIP, err)
 	}
+	if !addr.Is4() {
+		return fmt.Errorf("client IP must be IPv4: %q", clientIP)
+	}
+	prefix := netip.PrefixFrom(addr, 24)
+
+	// Заменяем все ранее назначенные IPv4-адреса на адаптере на наш единственный.
+	if err := luid.SetIPAddresses([]netip.Prefix{prefix}); err != nil {
+		return fmt.Errorf("set IPv4 address %s: %w", prefix, err)
+	}
+
+	// MTU выставляем напрямую через MibIPInterfaceRow.NLMTU.
+	row, err := luid.IPInterface(windows.AF_INET)
+	if err != nil {
+		return fmt.Errorf("get IPv4 interface entry: %w", err)
+	}
+	row.NLMTU = uint32(internal.TUNMTU)
+	// Метрика по умолчанию пусть остаётся "автоматическая" — split default
+	// route и так выигрывает по длине префикса, а возиться с UseAutomaticMetric
+	// руками это лишний риск.
+	row.UseAutomaticMetric = true
+	if err := row.Set(); err != nil {
+		return fmt.Errorf("set IPv4 interface entry: %w", err)
+	}
+
+	// IPv6 на адаптере выключаем — мы по нему всё равно не проксируем.
+	if row6, err := luid.IPInterface(windows.AF_INET6); err == nil {
+		row6.NLMTU = uint32(internal.TUNMTU)
+		_ = row6.Set()
+	}
+
 	return nil
 }
 
-// runNetsh запускает netsh.exe с переданными аргументами.
-func runNetsh(args ...string) error {
-	out, err := exec.Command("netsh.exe", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("netsh %s: %w (output: %s)",
-			strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+// winLUID возвращает LUID Wintun-адаптера, к которому привязан t.dev.
+// На любом другом backend-е tun.Device возвращается 0.
+func (t *TUN) winLUID() winipcfg.LUID {
+	nt, ok := t.dev.(*wgtun.NativeTun)
+	if !ok {
+		return 0
 	}
-	return nil
+	return winipcfg.LUID(nt.LUID())
 }
 
 // isClosedErr — Wintun после Close возвращает ERROR_HANDLE_EOF /

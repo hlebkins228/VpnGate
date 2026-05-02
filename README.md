@@ -249,8 +249,8 @@ $env:MYVPN_KEY     = "C:\myvpn\key.bin"
 При запуске клиент:
 
 - создаёт Wintun-адаптер с именем `myvpn0` и IP `10.0.0.2/24`;
-- через `netsh` ставит MTU 1420;
-- если `MYVPN_AUTO_ROUTES ≠ false`, добавляет три маршрута через `route.exe`:
+- настраивает IP/MTU 1420 напрямую через WinAPI (`winipcfg.LUID.SetIPAddresses` / `MibIPInterfaceRow.NLMTU`) — никаких внешних вызовов `netsh`;
+- если `MYVPN_AUTO_ROUTES ≠ false`, добавляет три маршрута через WinAPI (`winipcfg.LUID.AddRoute`, тот же путь использует сам WireGuard):
   - host-маршрут к API Gateway через прежний шлюз (чтобы не потерять связь);
   - `0.0.0.0/1` и `128.0.0.0/1` через туннель (split default route — перекрывают весь IPv4-простор без удаления оригинального дефолта);
 - при выходе аккуратно удаляет добавленные маршруты и закрывает Wintun-сессию.
@@ -260,7 +260,7 @@ $env:MYVPN_KEY     = "C:\myvpn\key.bin"
 ### Известные нюансы Windows-клиента
 
 - **Wintun не входит в репозиторий**. DLL качается с https://www.wintun.net/ (MIT-лицензия от WireGuard), кладётся рядом с `.exe`. Можно встроить её через `//go:embed` и распаковывать на лету, но текущий клиент этого не делает.
-- **DNS**: split default route отправит DNS-запросы в туннель. Если у вас на корпоративном Wi-Fi есть локальный DNS — он не будет доступен, пока туннель активен. Решение — указать публичный DNS в настройках адаптера (`netsh interface ipv4 add dnsservers "MyVPN" 8.8.8.8`).
+- **DNS**: split default route отправит DNS-запросы в туннель. Если у вас на корпоративном Wi-Fi есть локальный DNS — он не будет доступен, пока туннель активен. Решение — указать публичный DNS в настройках адаптера (`netsh interface ipv4 add dnsservers "myvpn0" 8.8.8.8`).
 - **IPv6 не маршрутизируется через VPN** — split default route добавлен только для IPv4. Если в системе включён IPv6 default-маршрут, IPv6-трафик пойдёт мимо туннеля. Чтобы этого избежать, отключите IPv6 на физическом интерфейсе или на адаптере Wintun.
 
 ## Локальная отладка без Yandex Cloud
@@ -311,9 +311,9 @@ echo "1a2b3c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890" | xxd -r
 client/                  — кросс-платформенный VPN-клиент:
                             tun.go            — общий wrapper над wireguard/tun
                             tun_linux.go      — настройка интерфейса через `ip`
-                            tun_windows.go    — настройка интерфейса через `netsh`
+                            tun_windows.go    — настройка интерфейса через winipcfg (WinAPI)
                             routes_linux.go   — RouteManager на `ip route`
-                            routes_windows.go — RouteManager на `route.exe` (split default)
+                            routes_windows.go — RouteManager на winipcfg.LUID.AddRoute (split default)
                             client.go         — общая логика VPNClient
 server/                  — Linux VPN-сервер: TUN (через wireguard/tun), NAT (iptables)
 internal/                — общий код (шифрование ChaCha20-Poly1305, сжатие LZ4, envcfg)
