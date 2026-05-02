@@ -25,9 +25,16 @@ const TUNInterfaceName = "myvpn0"
 // Снаружи предоставляет привычный пакетно-ориентированный Read/Write API
 // без батчинга — батчинг WireGuard-а здесь не нужен, потому что трафик
 // далее уходит в один WebSocket.
+//
+// rdScratch и wrScratch — внутренние буферы с резервом internal.TUNOffset
+// байт перед пакетом (требование tun.Device на Linux с IFF_VNET_HDR;
+// см. internal.TUNOffset). Read и Write вызываются из разных горутин,
+// поэтому буфера два — по одному на направление, мьютекс не нужен.
 type TUN struct {
-	dev  tun.Device
-	name string
+	dev       tun.Device
+	name      string
+	rdScratch []byte
+	wrScratch []byte
 }
 
 // NewTUN создаёт TUN-интерфейс с заданным именем и IP/маской.
@@ -55,15 +62,20 @@ func NewTUN(name, clientIP string) (*TUN, error) {
 		return nil, fmt.Errorf("configure %q: %w", actualName, err)
 	}
 
-	return &TUN{dev: dev, name: actualName}, nil
+	return &TUN{
+		dev:       dev,
+		name:      actualName,
+		rdScratch: make([]byte, internal.TUNOffset+internal.TUNMTU),
+		wrScratch: make([]byte, internal.TUNOffset+internal.TUNMTU),
+	}, nil
 }
 
 // Read читает один IP-пакет из TUN-интерфейса. Блокируется до появления
 // данных или закрытия. После Close возвращает io.EOF.
 func (t *TUN) Read(buf []byte) (int, error) {
-	bufs := [][]byte{buf}
+	bufs := [][]byte{t.rdScratch}
 	sizes := []int{0}
-	n, err := t.dev.Read(bufs, sizes, 0)
+	n, err := t.dev.Read(bufs, sizes, internal.TUNOffset)
 	if err != nil {
 		if errors.Is(err, tun.ErrTooManySegments) {
 			return 0, fmt.Errorf("tun read: %w", err)
@@ -78,7 +90,12 @@ func (t *TUN) Read(buf []byte) (int, error) {
 	if n == 0 {
 		return 0, nil
 	}
-	return sizes[0], nil
+	size := sizes[0]
+	if size > len(buf) {
+		return 0, fmt.Errorf("packet of %d bytes does not fit into %d-byte buffer", size, len(buf))
+	}
+	copy(buf, t.rdScratch[internal.TUNOffset:internal.TUNOffset+size])
+	return size, nil
 }
 
 // Write отправляет один IP-пакет в TUN-интерфейс.
@@ -86,8 +103,20 @@ func (t *TUN) Write(packet []byte) (int, error) {
 	if len(packet) == 0 {
 		return 0, nil
 	}
-	bufs := [][]byte{packet}
-	if _, err := t.dev.Write(bufs, 0); err != nil {
+	need := internal.TUNOffset + len(packet)
+	if cap(t.wrScratch) < need {
+		t.wrScratch = make([]byte, need)
+	} else {
+		t.wrScratch = t.wrScratch[:need]
+	}
+	// Обнуляем зону virtio_net_hdr, чтобы туда не попадали остатки от
+	// предыдущих записей разной длины.
+	for i := 0; i < internal.TUNOffset; i++ {
+		t.wrScratch[i] = 0
+	}
+	copy(t.wrScratch[internal.TUNOffset:], packet)
+	bufs := [][]byte{t.wrScratch}
+	if _, err := t.dev.Write(bufs, internal.TUNOffset); err != nil {
 		return 0, err
 	}
 	return len(packet), nil
