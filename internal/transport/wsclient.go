@@ -4,10 +4,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -32,6 +34,9 @@ const (
 	WSMaxMessageSize = 128 * 1024
 )
 
+// errClosed — sentinel-ошибка, возвращаемая Read/Write после Close.
+var errClosed = errors.New("websocket transport closed")
+
 // WSClientConfig параметры WebSocket клиента
 type WSClientConfig struct {
 	// URL адрес WebSocket сервера / API Gateway, например wss://host/path
@@ -46,25 +51,46 @@ type WSClientConfig struct {
 	PongWait time.Duration
 	// WriteTimeout таймаут на запись сообщения. 0 = WSDefaultWriteTimeout.
 	WriteTimeout time.Duration
+	// ReconnectMin минимальная задержка между попытками переподключения. 0 = WSDefaultReconnectMin.
+	// Установка <0 отключает автопереподключение (Read/Write вернут ошибку при разрыве).
+	ReconnectMin time.Duration
+	// ReconnectMax максимальная задержка между попытками. 0 = WSDefaultReconnectMax.
+	ReconnectMax time.Duration
 	// InsecureSkipVerify отключает проверку TLS сертификата (только для отладки).
 	InsecureSkipVerify bool
+	// Verbose подробное логирование (handshakes, reconnects).
+	Verbose bool
 }
 
 // WSClientTransport — WebSocket-транспорт для VPN клиента.
 //
 // Используется как двунаправленный канал поверх wss:// до Yandex API Gateway.
 // Каждый VPN-пакет отправляется как одно бинарное WebSocket-сообщение.
+//
+// Транспорт самостоятельно переподключается при потере соединения с
+// экспоненциальным backoff. Yandex API Gateway принудительно разрывает
+// WebSocket через 60 минут, поэтому автоматическое переподключение —
+// обязательное условие для долгоживущих VPN-сессий.
 type WSClientTransport struct {
-	cfg    WSClientConfig
-	conn   *websocket.Conn
-	connMu sync.Mutex // защищает conn от параллельной перепривязки
+	cfg WSClientConfig
 
-	writeMu sync.Mutex // сериализует запись в conn (gorilla требует один writer)
+	// conn — атомарный указатель на текущее WebSocket-соединение. nil во
+	// время переподключения. Read/Write подхватывают новое значение без
+	// блокировок.
+	conn atomic.Pointer[websocket.Conn]
+
+	// reconnectMu сериализует попытки переподключения, не блокируя Read/Write.
+	reconnectMu sync.Mutex
+	// writeMu сериализует запись в текущий conn (gorilla требует один writer).
+	writeMu sync.Mutex
 
 	done    chan struct{}
 	wg      sync.WaitGroup
 	closed  bool
 	closeMu sync.Mutex
+
+	// reconnectEnabled = false → Read/Write возвращают ошибку при разрыве.
+	reconnectEnabled bool
 }
 
 // NewWSClientTransport устанавливает WS соединение и возвращает готовый транспорт.
@@ -95,14 +121,31 @@ func NewWSClientTransport(cfg WSClientConfig) (*WSClientTransport, error) {
 		cfg.WriteTimeout = WSDefaultWriteTimeout
 	}
 
-	t := &WSClientTransport{
-		cfg:  cfg,
-		done: make(chan struct{}),
+	reconnect := true
+	if cfg.ReconnectMin < 0 || cfg.ReconnectMax < 0 {
+		reconnect = false
+	}
+	if cfg.ReconnectMin == 0 {
+		cfg.ReconnectMin = WSDefaultReconnectMin
+	}
+	if cfg.ReconnectMax == 0 {
+		cfg.ReconnectMax = WSDefaultReconnectMax
+	}
+	if cfg.ReconnectMax < cfg.ReconnectMin {
+		cfg.ReconnectMax = cfg.ReconnectMin
 	}
 
-	if err := t.dial(); err != nil {
+	t := &WSClientTransport{
+		cfg:              cfg,
+		done:             make(chan struct{}),
+		reconnectEnabled: reconnect,
+	}
+
+	conn, err := t.dialNew()
+	if err != nil {
 		return nil, err
 	}
+	t.conn.Store(conn)
 
 	if cfg.PingInterval > 0 {
 		t.wg.Add(1)
@@ -112,8 +155,9 @@ func NewWSClientTransport(cfg WSClientConfig) (*WSClientTransport, error) {
 	return t, nil
 }
 
-// dial выполняет рукопожатие и сохраняет conn.
-func (t *WSClientTransport) dial() error {
+// dialNew выполняет одно WebSocket-рукопожатие и возвращает новое соединение.
+// Не трогает t.conn — caller сам решает, как с ним поступить.
+func (t *WSClientTransport) dialNew() (*websocket.Conn, error) {
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = t.cfg.HandshakeTimeout
 	if t.cfg.InsecureSkipVerify {
@@ -122,7 +166,7 @@ func (t *WSClientTransport) dial() error {
 
 	conn, _, err := dialer.Dial(t.cfg.URL, t.cfg.Headers)
 	if err != nil {
-		return fmt.Errorf("websocket dial failed: %w", err)
+		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
 
 	conn.SetReadLimit(WSMaxMessageSize)
@@ -133,22 +177,91 @@ func (t *WSClientTransport) dial() error {
 			return nil
 		})
 	}
+	return conn, nil
+}
 
-	t.connMu.Lock()
-	t.conn = conn
-	t.connMu.Unlock()
-	return nil
+// reconnect закрывает сломанное соединение и устанавливает новое с
+// экспоненциальным backoff. Возвращает nil после успешного переподключения,
+// либо errClosed, если транспорт закрыт во время попыток.
+//
+// Несколько одновременных вызовов сериализуются через reconnectMu; повторные
+// вызовы, заставшие уже актуальный t.conn (отличный от broken), сразу выходят.
+func (t *WSClientTransport) reconnect(broken *websocket.Conn) error {
+	t.reconnectMu.Lock()
+	defer t.reconnectMu.Unlock()
+
+	// Если кто-то уже успел переподключить раньше — выходим.
+	if cur := t.conn.Load(); cur != nil && cur != broken {
+		return nil
+	}
+
+	// Помечаем conn как nil, чтобы Read/Write увидели "переподключаемся".
+	t.conn.Store(nil)
+
+	// Закрываем сломанное соединение (если ещё не закрыто).
+	if broken != nil {
+		_ = broken.Close()
+	}
+
+	backoff := t.cfg.ReconnectMin
+	for {
+		select {
+		case <-t.done:
+			return errClosed
+		default:
+		}
+
+		conn, err := t.dialNew()
+		if err == nil {
+			t.conn.Store(conn)
+			log.Printf("websocket: reconnected to %s", t.cfg.URL)
+			return nil
+		}
+
+		log.Printf("websocket: reconnect failed: %v; retrying in %s", err, backoff)
+		select {
+		case <-t.done:
+			return errClosed
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > t.cfg.ReconnectMax {
+			backoff = t.cfg.ReconnectMax
+		}
+	}
+}
+
+// invalidateConn помечает conn как сломанное (closes it and clears t.conn).
+// Безопасно вызывать при гонках: проверяет, что t.conn совпадает с broken.
+func (t *WSClientTransport) invalidateConn(broken *websocket.Conn) {
+	if t.conn.CompareAndSwap(broken, nil) {
+		_ = broken.Close()
+	}
 }
 
 // Write отправляет одно бинарное WebSocket сообщение.
+//
+// При reconnectEnabled=true и временной ошибке записи: помечает соединение
+// сломанным и возвращает nil (пакет «потерян», но Read-горутина переподключит
+// транспорт). Это предпочтительно для VPN-трафика — TCP внутри туннеля сам
+// перешлёт пропавшие пакеты, а возврат ошибки наверх вызвал бы каскадный
+// shutdown VPN-клиента.
 func (t *WSClientTransport) Write(data []byte) (int, error) {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 
-	t.connMu.Lock()
-	conn := t.conn
-	t.connMu.Unlock()
+	select {
+	case <-t.done:
+		return 0, errClosed
+	default:
+	}
+
+	conn := t.conn.Load()
 	if conn == nil {
+		if t.reconnectEnabled {
+			// Транспорт переподключается; молча дропаем пакет.
+			return len(data), nil
+		}
 		return 0, errors.New("websocket not connected")
 	}
 
@@ -156,6 +269,13 @@ func (t *WSClientTransport) Write(data []byte) (int, error) {
 		_ = conn.SetWriteDeadline(time.Now().Add(t.cfg.WriteTimeout))
 	}
 	if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+		if t.reconnectEnabled {
+			if t.cfg.Verbose {
+				log.Printf("websocket: write error: %v; will reconnect on next read", err)
+			}
+			t.invalidateConn(conn)
+			return len(data), nil
+		}
 		return 0, err
 	}
 	return len(data), nil
@@ -163,24 +283,44 @@ func (t *WSClientTransport) Write(data []byte) (int, error) {
 
 // Read блокируется до получения следующего бинарного сообщения и копирует его в buf.
 // Возвращает количество записанных в buf байт.
+//
+// При reconnectEnabled=true ошибки сети не возвращаются наверх: транспорт
+// автоматически переподключается с backoff'ом. Read возвращает ошибку только
+// после Close().
 func (t *WSClientTransport) Read(buf []byte) (int, error) {
-	t.connMu.Lock()
-	conn := t.conn
-	t.connMu.Unlock()
-	if conn == nil {
-		return 0, errors.New("websocket not connected")
-	}
-
 	for {
 		select {
 		case <-t.done:
-			return 0, errors.New("websocket transport closed")
+			return 0, errClosed
 		default:
+		}
+
+		conn := t.conn.Load()
+		if conn == nil {
+			if !t.reconnectEnabled {
+				return 0, errors.New("websocket not connected")
+			}
+			if err := t.reconnect(nil); err != nil {
+				return 0, err
+			}
+			continue
 		}
 
 		msgType, payload, err := conn.ReadMessage()
 		if err != nil {
-			return 0, err
+			select {
+			case <-t.done:
+				return 0, errClosed
+			default:
+			}
+			if !t.reconnectEnabled {
+				return 0, err
+			}
+			log.Printf("websocket: read error: %v; reconnecting", err)
+			if err := t.reconnect(conn); err != nil {
+				return 0, err
+			}
+			continue
 		}
 		if msgType != websocket.BinaryMessage {
 			// текстовые сообщения игнорируем — VPN использует только бинарный канал
@@ -206,9 +346,7 @@ func (t *WSClientTransport) pingLoop() {
 		case <-t.done:
 			return
 		case <-ticker.C:
-			t.connMu.Lock()
-			conn := t.conn
-			t.connMu.Unlock()
+			conn := t.conn.Load()
 			if conn == nil {
 				continue
 			}
@@ -219,8 +357,12 @@ func (t *WSClientTransport) pingLoop() {
 			err := conn.WriteMessage(websocket.PingMessage, nil)
 			t.writeMu.Unlock()
 			if err != nil {
-				// не закрываем явно — Read вернёт ошибку и наверху отработает reconnect/выход
-				return
+				if t.cfg.Verbose {
+					log.Printf("websocket: ping error: %v", err)
+				}
+				if t.reconnectEnabled {
+					t.invalidateConn(conn)
+				}
 			}
 		}
 	}
@@ -237,13 +379,10 @@ func (t *WSClientTransport) Close() error {
 	close(t.done)
 	t.closeMu.Unlock()
 
-	t.connMu.Lock()
-	conn := t.conn
-	t.conn = nil
-	t.connMu.Unlock()
+	conn := t.conn.Swap(nil)
 
 	if conn != nil {
-		// Best effort: посылаем close-фрейм и закрываем сокет
+		// Best effort: посылаем close-фрейм и закрываем сокет.
 		t.writeMu.Lock()
 		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		_ = conn.WriteMessage(websocket.CloseMessage,

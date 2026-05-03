@@ -52,59 +52,273 @@ go build -o myvpn-client ./cmd/client
 GOOS=windows GOARCH=amd64 go build -o myvpn-client.exe ./cmd/client
 ```
 
-## Настройка Yandex API Gateway
+## Развёртывание через Yandex API Gateway
 
-1. **Создайте сервисный аккаунт** в Yandex Cloud и выдайте ему права на использование Connection Management API:
+Это рабочий продакшен-режим: клиент подключается по `wss://` к Yandex API Gateway, тот вызывает HTTP-вебхуки на ваш VPN-сервер, а сервер пушит обратные пакеты через Yandex Connection Management API. Ниже — полный путь от пустого облака до работающего туннеля.
+
+### Что вам понадобится
+
+- Аккаунт в [Yandex Cloud](https://yandex.cloud/) с привязанным платёжным аккаунтом (API Gateway и трафик платные).
+- Установленный и авторизованный [`yc`](https://yandex.cloud/ru/docs/cli/quickstart) CLI (`yc init`).
+- Домен с TLS-сертификатом, указывающий на ваш VPN-сервер (нужен для HTTPS, без него API Gateway не сможет постучаться в бэкенд). Удобнее всего использовать Caddy — он сам выпустит сертификат через Let's Encrypt.
+- Один из двух вариантов сервера:
+  - **Yandex Compute Cloud-ВМ** с привязанным сервисным аккаунтом (рекомендуется — IAM-токен берётся из metadata-сервиса автоматически).
+  - **Внешний VPS** — тогда IAM-токен придётся обновлять самостоятельно через файл и cron.
+
+Перед запуском зафиксируйте идентификаторы фолдера и облака:
+
+```bash
+yc config get folder-id
+yc config get cloud-id
+```
+
+### Шаг 1. Сервисный аккаунт и роль для Connection Management API
+
+Сервисный аккаунт нужен серверу, чтобы получать IAM-токен и через него пушить пакеты обратно в API Gateway.
+
+```bash
+# создаём SA
+yc iam service-account create --name myvpn-server
+
+# узнаём id фолдера один раз
+FOLDER_ID=$(yc config get folder-id)
+
+# выдаём SA минимально необходимую роль:
+# api-gateway.websocketWriter — даёт право на :send в Connection Management API
+yc resource-manager folder add-access-binding "$FOLDER_ID" \
+    --role api-gateway.websocketWriter \
+    --service-account-name myvpn-server
+```
+
+Если ваша область видимости (фолдер) не позволяет назначать конкретно `api-gateway.websocketWriter`, можно временно дать `editor` на фолдер — этого тоже хватит, но это значительно шире, чем нужно.
+
+Если запускаете VPN-сервер **на ВМ Yandex Compute Cloud** — привяжите этот SA к ВМ:
+
+```bash
+yc compute instance update <INSTANCE_NAME_OR_ID> \
+    --service-account-name myvpn-server
+```
+
+После этого на ВМ заработает metadata-сервис: код сервера сам подтянет IAM-токен с `http://169.254.169.254/...` и будет его обновлять автоматически.
+
+Если запускаете на **внешнем VPS** — создайте на своей машине авторизованный ключ или пользуйтесь уже залогиненным `yc` и обновляйте токен периодически (см. [шаг 4](#шаг-4-настройка-iam-токена-если-внешний-vps)).
+
+### Шаг 2. Публичный HTTPS-эндпоинт для VPN-сервера
+
+API Gateway требует, чтобы интеграция отвечала по `https://` — без TLS вебхуки доходить не будут. Самый короткий путь — поставить Caddy перед сервером.
+
+1. На VPN-сервере направьте A-запись вашего домена на его IP (например, `vpn.example.com → 1.2.3.4`).
+2. Поставьте Caddy и положите простую конфигурацию:
 
    ```bash
-   yc iam service-account create --name myvpn-gw
-   yc resource-manager folder add-access-binding <FOLDER_ID> \
-       --role serverless.apiGateway.websocketWriter \
-       --service-account-name myvpn-gw
+   sudo apt install caddy   # или установите по https://caddyserver.com/docs/install
+   sudo nano /etc/caddy/Caddyfile
    ```
 
-   Если такой роли нет в вашем фолдере, используйте роль `editor` на фолдер (минимально требуется доступ к `apigateway.websocket.connections.send`).
-
-2. **Подготовьте OpenAPI-спецификацию** API Gateway. Готовый шаблон лежит в [`examples/api-gateway.yaml`](examples/api-gateway.yaml). Замените в нём `VPN_SERVER_URL` на публичный HTTPS-адрес вашего VPN-сервера (например `vpn.example.com`):
-
-   ```yaml
-   paths:
-     /ws:
-       x-yc-apigateway-websocket-connect:
-         x-yc-apigateway-integration:
-           type: http
-           url: https://vpn.example.com/ws
-           method: POST
-           headers:
-             X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-             X-Yc-Apigateway-Websocket-Event-Type: 'CONNECT'
-       x-yc-apigateway-websocket-message:
-         x-yc-apigateway-integration:
-           type: http
-           url: https://vpn.example.com/ws
-           method: POST
-           headers:
-             X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-             X-Yc-Apigateway-Websocket-Event-Type: 'MESSAGE'
-       x-yc-apigateway-websocket-disconnect:
-         x-yc-apigateway-integration:
-           type: http
-           url: https://vpn.example.com/ws
-           method: POST
-           headers:
-             X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-             X-Yc-Apigateway-Websocket-Event-Type: 'DISCONNECT'
+   ```caddy
+   vpn.example.com {
+       reverse_proxy 127.0.0.1:8080 {
+           # API Gateway шлёт сообщения до 128 КБ; даём запас
+           transport http {
+               read_timeout 90s
+               write_timeout 90s
+           }
+       }
+   }
    ```
 
-3. **Создайте API Gateway**:
+   ```bash
+   sudo systemctl reload caddy
+   ```
+
+   Caddy сам получит и продлит сертификат через Let's Encrypt. Проверьте, что HTTPS поднялся: `curl -I https://vpn.example.com/healthz` (страница 404 — это нормально, главное чтобы был ответ от сервера, а не TLS-ошибка).
+
+   <details>
+   <summary>Альтернатива: nginx</summary>
+
+   ```nginx
+   server {
+       listen 443 ssl http2;
+       server_name vpn.example.com;
+
+       ssl_certificate     /etc/letsencrypt/live/vpn.example.com/fullchain.pem;
+       ssl_certificate_key /etc/letsencrypt/live/vpn.example.com/privkey.pem;
+
+       location /ws {
+           proxy_pass http://127.0.0.1:8080/ws;
+           proxy_request_buffering off;     # API Gateway шлёт бинарь крупными кусками
+           proxy_buffering off;
+           client_max_body_size 256k;       # запас сверх 128 КБ лимита API Gateway
+           proxy_read_timeout 90s;
+           proxy_send_timeout 90s;
+       }
+   }
+   ```
+
+   </details>
+
+3. Откройте порт 443 на firewall (для Yandex Compute: security group → правило allow tcp:443).
+
+### Шаг 3. Сборка и деплой VPN-сервера
+
+На целевой Linux-машине:
+
+```bash
+# собрать
+go build -o myvpn-server ./cmd/server
+
+# подготовить ключ ChaCha20-Poly1305 (32 байта). Тот же файл нужен клиенту.
+sudo install -d -m 700 /etc/myvpn
+dd if=/dev/urandom of=/etc/myvpn/key.bin bs=1 count=32
+sudo install -m 600 ./myvpn-server /usr/local/bin/myvpn-server
+
+# первый запуск (обычно через systemd unit):
+sudo /usr/local/bin/myvpn-server -key /etc/myvpn/key.bin
+```
+
+При корректной работе в логе должно появиться:
+
+```
+✓ Network configured: IP forwarding enabled, NAT via eth0
+VPN server listening on :8080 (HTTP)
+  webhook path:  /ws
+  ...
+VPN server started. Press Ctrl+C to stop ...
+```
+
+### Шаг 4. Настройка IAM-токена (если внешний VPS)
+
+На Yandex Compute Cloud-ВМ с привязанным SA (см. шаг 1) — пропустите этот шаг, токен сервер берёт автоматически.
+
+На внешнем VPS — обновляйте токен по cron каждые 30–60 минут:
+
+```bash
+# /usr/local/bin/refresh-yc-token
+#!/bin/bash
+set -e
+yc iam create-token > /run/yc-iam-token.tmp
+mv /run/yc-iam-token.tmp /run/yc-iam-token
+chmod 600 /run/yc-iam-token
+```
+
+```cron
+# crontab -e
+*/30 * * * * /usr/local/bin/refresh-yc-token >> /var/log/yc-token.log 2>&1
+```
+
+И запускайте сервер с переменной окружения:
+
+```bash
+sudo MYVPN_IAM_TOKEN_FILE=/run/yc-iam-token \
+    /usr/local/bin/myvpn-server -key /etc/myvpn/key.bin
+```
+
+Сервер сам перечитывает файл раз в 5 минут — рестарт после обновления не нужен.
+
+Альтернативно, можно прямо передать статический токен (живёт ~12 часов):
+
+```bash
+sudo YC_IAM_TOKEN="$(yc iam create-token)" \
+    /usr/local/bin/myvpn-server -key /etc/myvpn/key.bin
+```
+
+### Шаг 5. Создание API Gateway
+
+1. Откройте [`examples/api-gateway.yaml`](examples/api-gateway.yaml) и замените все вхождения `VPN_SERVER_URL` на ваш домен из шага 2 (например, `vpn.example.com`):
+
+   ```bash
+   sed -i 's/VPN_SERVER_URL/vpn.example.com/g' examples/api-gateway.yaml
+   ```
+
+2. Создайте API Gateway:
 
    ```bash
    yc serverless api-gateway create \
        --name myvpn-ws \
-       --spec=examples/api-gateway.yaml
+       --spec examples/api-gateway.yaml
    ```
 
-   После создания запомните выданный домен (`d5d...apigw.yandexcloud.net`). URL клиентского соединения будет `wss://<домен>/ws`.
+   После создания посмотрите выданный домен:
+
+   ```bash
+   yc serverless api-gateway get myvpn-ws --format json | jq -r .domain
+   # пример: d5d4abcdefghij1234567.apigw.yandexcloud.net
+   ```
+
+   Если позже понадобится подменить спецификацию (например, сменили домен бэкенда):
+
+   ```bash
+   yc serverless api-gateway update myvpn-ws --spec examples/api-gateway.yaml
+   ```
+
+### Шаг 6. Smoke-тест из консоли
+
+До запуска полного клиента можно проверить, что webhook'и доходят, через [`wscat`](https://www.npmjs.com/package/wscat):
+
+```bash
+npm install -g wscat
+wscat -c "wss://d5d4abcdefghij1234567.apigw.yandexcloud.net/ws"
+# > Connected (press CTRL+C to quit)
+# Введите любой произвольный текст — клиент сам по себе ничего полезного
+# не отправит, но в логах VPN-сервера должна появиться строка
+# "ws/gateway: client <connection-id> connected" (если включён -verbose).
+```
+
+Если в логах сервера видна запись о CONNECT — значит, цепочка `клиент → API Gateway → Caddy/nginx → myvpn-server` работает, и можно запускать настоящий VPN-клиент.
+
+### Шаг 7. Запуск VPN-клиента
+
+Передайте клиенту тот же `key.bin`, что у сервера, и URL вашего API Gateway (`wss://<домен>/ws`):
+
+```bash
+# Linux
+sudo ./myvpn-client \
+    -server "wss://d5d4abcdefghij1234567.apigw.yandexcloud.net/ws" \
+    -key /etc/myvpn/key.bin
+
+# Windows (PowerShell от администратора, рядом с .exe должна лежать wintun.dll)
+.\myvpn-client.exe `
+    -server "wss://d5d4abcdefghij1234567.apigw.yandexcloud.net/ws" `
+    -key C:\myvpn\key.bin
+```
+
+Клиент сам:
+
+- настроит TUN-интерфейс с IP `10.0.0.2/24`,
+- добавит host-маршрут до домена API Gateway через прежний шлюз (чтобы внутри туннеля не потерять связь с самим gateway),
+- развернёт split-default route (`0.0.0.0/1` + `128.0.0.0/1`) поверх существующего default-маршрута,
+- при потере WebSocket'а (например, по 60-минутному лимиту API Gateway) **автоматически переподключится** с экспоненциальным backoff'ом — VPN-клиент при этом не выходит.
+
+### Проверка, что всё работает
+
+После запуска клиента:
+
+```bash
+curl https://ifconfig.me        # должен вернуть IP вашего VPN-сервера, а не вашего интернет-провайдера
+curl https://api.ipify.org      # дублирующая проверка
+ping -c 3 8.8.8.8               # ICMP должен ходить через туннель
+```
+
+В логах VPN-сервера на `-verbose` будут видны webhook-сообщения вида:
+
+```
+ws/webhook: client <connection-id> connected via API Gateway
+Received 76 bytes from client <connection-id>, writing to TUN
+TUN: 198 bytes -> 1 client(s)
+```
+
+### Troubleshooting
+
+| Симптом | Что проверить |
+|---|---|
+| Клиент не подключается, в `wscat` сразу `error: Unexpected server response: 502` | API Gateway не смог достучаться до бэкенда. Проверьте: открыт ли 443 на firewall, доступен ли `https://vpn.example.com/ws` снаружи (попробуйте `curl -X POST https://vpn.example.com/ws -H 'X-Yc-Apigateway-Websocket-Event-Type: CONNECT' -H 'X-Yc-Apigateway-Websocket-Connection-Id: test'`). |
+| Клиент подключился, но `curl ifconfig.me` показывает реальный IP | Маршруты не настроились. На Linux: `ip route`, должны быть `0.0.0.0/1 dev myvpn0` и `128.0.0.0/1 dev myvpn0`. На Windows запустите клиент с `-verbose` — выведется итоговая forwarding table. |
+| В логе сервера `push to <id>: HTTP 401 Unauthorized` | IAM-токен невалиден. На Compute Cloud-ВМ — проверьте, что SA привязан (`yc compute instance get ... | grep service_account_id`). На внешнем VPS — пересоздайте файл с токеном (`yc iam create-token > /run/yc-iam-token`). |
+| В логе сервера `push to <id>: HTTP 403 Forbidden` | Сервисному аккаунту не выдана роль `api-gateway.websocketWriter`. Пересмотрите шаг 1. |
+| В логе сервера `push to <id>: HTTP 404 Not Found` | Соединение уже закрыто на стороне API Gateway (idle/таймаут/клиент дисконнект). Это нормально, но если повторяется — возможно, бэкенд не успевает обработать DISCONNECT. |
+| Клиент после 60 минут переподключается, но трафик не идёт | TCP-соединения внутри туннеля пережили реконнект и пытаются продолжаться через старые номера соединений. Это сетевой эффект, не баг — TCP сам обнаружит проблему и переустановит соединение. |
+| `Error reading from TUN: too many segments` в логе сервера | Должно быть исправлено в текущей версии (батчевое чтение TUN с учётом GRO/TSO offload'ов). Если воспроизводится — пересоберите сервер из последнего main. |
+| Логи сервера тихие, при этом клиент пишет `websocket: read error ... reconnecting` каждые несколько секунд | Скорее всего, TLS-прокси перед сервером отбивает запросы (например, `client_max_body_size` маловат у nginx, или Caddy отвалился). Проверьте логи прокси. |
 
 ## Запуск VPN-сервера
 
@@ -301,7 +515,7 @@ echo "1a2b3c4d5e6f7890abcdef1234567890abcdef1234567890abcdef1234567890" | xxd -r
 
 - **Размер пакета**: Yandex API Gateway ограничивает WebSocket-сообщение 128 КБ. С TUN MTU 1420 + overhead ChaCha20-Poly1305 (28 байт) + флаг сжатия (1 байт) пакет помещается с большим запасом.
 - **Idle-таймаут**: API Gateway закрывает соединение, если оно молчит 10 минут. Клиент шлёт ping-фреймы каждые 30 секунд, поэтому в норме соединение поддерживается.
-- **Время жизни соединения**: API Gateway принудительно разрывает WebSocket через 60 минут. В этом случае клиент завершает работу — рестарт восстановит соединение.
+- **Время жизни соединения**: API Gateway принудительно разрывает WebSocket через 60 минут. Клиент **автоматически переподключается** с экспоненциальным backoff'ом — VPN-сессия не прерывается, но TCP-соединения внутри туннеля во время разрыва теряют пакеты (TCP их перешлёт сам).
 - **Биллинг**: оплачивается количество запросов и исходящий трафик API Gateway (см. [тарификацию](https://yandex.cloud/ru/docs/api-gateway/pricing)). Ping-фреймы и сообщения от сервера к клиенту бесплатны.
 - **TLS на сервере**: Yandex API Gateway требует HTTPS до бэкенда. Без TLS вебхуки работать не будут.
 

@@ -98,11 +98,17 @@ func NewVPNClient(cfg VPNClientConfig) (*VPNClient, error) {
 
 // Connect подключается к VPN-серверу через WebSocket и обрабатывает пакеты
 // до отмены ctx или вызова Close.
+//
+// При обрыве WebSocket'а (например, по 60-минутному лимиту Yandex API Gateway
+// или транзиентной сетевой ошибке) транспорт сам переподключается с
+// экспоненциальным backoff'ом — VPN-клиент при этом не выходит, пакеты в
+// момент разрыва просто дропаются (TCP внутри туннеля их перешлёт).
 func (c *VPNClient) Connect(ctx context.Context) error {
 	wsTransport, err := transport.NewWSClientTransport(transport.WSClientConfig{
 		URL:                c.cfg.ServerURL,
 		Headers:            c.cfg.ExtraHeaders,
 		InsecureSkipVerify: c.cfg.InsecureSkipVerify,
+		Verbose:            c.cfg.Verbose,
 	})
 	if err != nil {
 		return fmt.Errorf("create WebSocket transport: %w", err)

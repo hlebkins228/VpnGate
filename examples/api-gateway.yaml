@@ -3,15 +3,21 @@ info:
   title: MyVPN WebSocket Gateway
   version: 1.0.0
   description: |
-    Yandex API Gateway specification for the MyVPN over WebSocket transport.
+    OpenAPI spec for Yandex API Gateway, проксирующего WebSocket до VPN-сервера.
 
-    The gateway accepts client WebSocket connections at /ws and forwards every
-    $connect / $message / $disconnect event to the VPN server's HTTP webhook.
-    The VPN server pushes packets back to clients via the Connection
-    Management API (apigateway-connections.api.cloud.yandex.net).
+    Что делает:
+      * принимает клиентское WebSocket-соединение по пути /ws;
+      * на каждом событии (CONNECT / MESSAGE / DISCONNECT) шлёт HTTP-вебхук
+        на VPN-сервер по адресу из переменной VPN_SERVER_URL;
+      * VPN-сервер пушит ответные пакеты обратно через
+        Connection Management API (apigateway-connections.api.cloud.yandex.net).
 
-    Replace VPN_SERVER_URL below with the public HTTPS URL of your VPN server's
-    webhook endpoint, e.g. https://vpn.example.com:8080/ws
+    Перед загрузкой замените VPN_SERVER_URL на публичный HTTPS-адрес вашего
+    VPN-сервера, например https://vpn.example.com . Сам путь /ws при этом
+    оставьте как есть — он совпадает с MYVPN_WEBHOOK_PATH по умолчанию.
+
+    Headers X-Yc-Apigateway-Websocket-* API Gateway добавляет в HTTP-запрос
+    к интеграции автоматически — явно перечислять их в headers не требуется.
 
 paths:
   /ws:
@@ -20,10 +26,6 @@ paths:
         type: http
         url: https://VPN_SERVER_URL/ws
         method: POST
-        headers:
-          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-          X-Yc-Apigateway-Websocket-Event-Type: 'CONNECT'
-          X-Yc-Apigateway-Websocket-Connected-At: '{X-Yc-Apigateway-Websocket-Connected-At}'
         timeouts:
           connect: 5
           read: 30
@@ -32,9 +34,6 @@ paths:
         type: http
         url: https://VPN_SERVER_URL/ws
         method: POST
-        headers:
-          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-          X-Yc-Apigateway-Websocket-Event-Type: 'MESSAGE'
         timeouts:
           connect: 5
           read: 60
@@ -43,11 +42,6 @@ paths:
         type: http
         url: https://VPN_SERVER_URL/ws
         method: POST
-        headers:
-          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-          X-Yc-Apigateway-Websocket-Event-Type: 'DISCONNECT'
-          X-Yc-Apigateway-Websocket-Disconnect-Status-Code: '{X-Yc-Apigateway-Websocket-Disconnect-Status-Code}'
-          X-Yc-Apigateway-Websocket-Disconnect-Reason: '{X-Yc-Apigateway-Websocket-Disconnect-Reason}'
         timeouts:
           connect: 5
           read: 10
