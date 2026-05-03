@@ -57,17 +57,19 @@ func NewTUN(name, clientIP string) (*TUN, error) {
 		return nil, fmt.Errorf("get TUN name: %w", err)
 	}
 
-	if err := configureInterface(actualName, clientIP); err != nil {
-		_ = dev.Close()
-		return nil, fmt.Errorf("configure %q: %w", actualName, err)
-	}
-
-	return &TUN{
+	t := &TUN{
 		dev:       dev,
 		name:      actualName,
 		rdScratch: make([]byte, internal.TUNOffset+internal.TUNMTU),
 		wrScratch: make([]byte, internal.TUNOffset+internal.TUNMTU),
-	}, nil
+	}
+
+	if err := configureInterface(t, clientIP); err != nil {
+		_ = dev.Close()
+		return nil, fmt.Errorf("configure %q: %w", actualName, err)
+	}
+
+	return t, nil
 }
 
 // Read читает один IP-пакет из TUN-интерфейса. Блокируется до появления

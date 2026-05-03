@@ -27,7 +27,7 @@ type RouteManager struct {
 }
 
 // NewRouteManager резолвит hostname сервера в IP и подготавливает менеджер.
-func NewRouteManager(tunInterface, serverAddr string) (*RouteManager, error) {
+func NewRouteManager(t *TUN, serverAddr string) (*RouteManager, error) {
 	host, _, err := net.SplitHostPort(serverAddr)
 	if err != nil {
 		host = serverAddr
@@ -36,8 +36,12 @@ func NewRouteManager(tunInterface, serverAddr string) (*RouteManager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve %q: %w", host, err)
 	}
-	return &RouteManager{tunInterface: tunInterface, serverIP: addr.IP.String()}, nil
+	return &RouteManager{tunInterface: t.Name(), serverIP: addr.IP.String()}, nil
 }
+
+// SetVerbose — заглушка для общего интерфейса с Windows-реализацией. На Linux
+// `ip route` сам по себе достаточно вербозен.
+func (rm *RouteManager) SetVerbose(_ bool) {}
 
 // SetupRoutes перестраивает таблицу маршрутизации.
 func (rm *RouteManager) SetupRoutes() error {

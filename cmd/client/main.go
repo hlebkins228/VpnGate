@@ -52,6 +52,17 @@ func main() {
 		log.Fatal("Key file is required. Pass -key /path/to/key or set MYVPN_KEY env var.")
 	}
 
+	// Печатаем эффективную конфигурацию ДО подключения, чтобы при разборе
+	// логов не приходилось гадать какой режим был выбран. Особенно полезно
+	// для AutoRoutes: его легко случайно выключить через MYVPN_AUTO_ROUTES.
+	log.Printf("Config: server=%s clientIP=%s autoRoutes=%v verbose=%v",
+		*serverURL, *clientIP, autoRoutes, *verbose)
+	if !autoRoutes {
+		log.Println("Config: AutoRoutes disabled — VPN tunnel will be created, " +
+			"but your default route stays put. Set MYVPN_AUTO_ROUTES=true (or unset it) " +
+			"to route all traffic through VPN.")
+	}
+
 	key, err := loadKey(*keyFile)
 	if err != nil {
 		log.Fatalf("Failed to load key: %v", err)

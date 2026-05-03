@@ -79,11 +79,12 @@ func NewVPNClient(cfg VPNClientConfig) (*VPNClient, error) {
 			_ = tun.Close()
 			return nil, fmt.Errorf("extract host from %q: %w", cfg.ServerURL, err)
 		}
-		rm, err = NewRouteManager(tun.Name(), host)
+		rm, err = NewRouteManager(tun, host)
 		if err != nil {
 			_ = tun.Close()
 			return nil, fmt.Errorf("create route manager: %w", err)
 		}
+		rm.SetVerbose(cfg.Verbose)
 	}
 
 	return &VPNClient{
@@ -111,12 +112,21 @@ func (c *VPNClient) Connect(ctx context.Context) error {
 	log.Printf("Connected to VPN server at %s", c.cfg.ServerURL)
 	log.Printf("TUN interface: %s", c.tun.Name())
 
-	if c.cfg.AutoRoutes && c.routeManager != nil {
+	switch {
+	case !c.cfg.AutoRoutes:
+		log.Println("Routes: AutoRoutes is disabled (MYVPN_AUTO_ROUTES=false). " +
+			"Only traffic explicitly routed through this TUN will use the VPN.")
+	case c.routeManager == nil:
+		log.Println("Routes: WARNING — AutoRoutes requested but no route manager " +
+			"was created. VPN traffic will not be routed.")
+	default:
+		log.Println("Routes: AutoRoutes enabled, configuring split default route...")
 		if err := c.routeManager.SetupRoutes(); err != nil {
-			log.Printf("Warning: failed to setup routes: %v", err)
-			log.Println("You may need to configure routes manually")
+			log.Printf("Routes: ERROR setting up routes: %v", err)
+			log.Println("Routes: VPN traffic will NOT flow until this is fixed " +
+				"(usually: insufficient privileges, or another VPN already owns the default route)")
 		} else {
-			log.Println("Routes configured: all traffic now goes through VPN")
+			log.Println("Routes: configured — all IPv4 traffic now flows through the VPN")
 		}
 	}
 
