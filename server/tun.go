@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os/exec"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -19,18 +20,29 @@ const TUNInterfaceName = "myvpn0"
 
 // TUN — обёртка над tun.Device из библиотеки WireGuard.
 //
-// На Linux использует /dev/net/tun (тот же путь, что и любой другой VPN-софт),
+// Использует /dev/net/tun (тот же путь, что любой другой VPN-софт),
 // но без ручных ioctl: вся низкоуровневая работа делегирована
 // golang.zx2c4.com/wireguard/tun.
 //
-// rdScratch и wrScratch — внутренние буферы с резервом internal.TUNOffset
-// байт перед пакетом. Это требование tun.Device на Linux (см. TUNOffset).
-// Read/Write сериализуются на уровне вызывающей логики (по одной горутине
-// на направление), поэтому защищать буферы мьютексом не нужно.
+// rdBufs — внутренние батчевые буфера: на Linux с включённым TSO/GRO
+// offload ядро может прислать один "super-packet" (до 64 КБ), который
+// библиотека сегментирует на N MTU-сегментов и складывает в bufs[0:n].
+// Если bufs всего один — при первом же реальном TCP-флоу выпадет
+// tun.ErrTooManySegments и читалка завершится. Выделяем сразу
+// dev.BatchSize() слотов (на Linux обычно 128) и отдаём пакеты наружу
+// по одному из rdBufs.
+//
+// Read и Write сериализуются на уровне вызывающей логики (по одной
+// горутине на направление), поэтому защищать буфера мьютексом не нужно.
 type TUN struct {
-	dev      tun.Device
-	name     string
-	rdScratch []byte
+	dev  tun.Device
+	name string
+
+	rdBufs  [][]byte
+	rdSizes []int
+	rdAvail int
+	rdNext  int
+
 	wrScratch []byte
 }
 
@@ -56,34 +68,64 @@ func NewTUN(name string) (*TUN, error) {
 		return nil, fmt.Errorf("setup %q: %w", actualName, err)
 	}
 
+	batchSize := dev.BatchSize()
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	rdBufs := make([][]byte, batchSize)
+	for i := range rdBufs {
+		rdBufs[i] = make([]byte, internal.TUNOffset+internal.TUNMTU)
+	}
+
 	return &TUN{
 		dev:       dev,
 		name:      actualName,
-		rdScratch: make([]byte, internal.TUNOffset+internal.TUNMTU),
+		rdBufs:    rdBufs,
+		rdSizes:   make([]int, batchSize),
 		wrScratch: make([]byte, internal.TUNOffset+internal.TUNMTU),
 	}, nil
 }
 
-// Read читает один IP-пакет.
+// Read возвращает один IP-пакет. Если предыдущий батчевый dev.Read получил
+// несколько сегментов, отдаёт их последовательно из внутренней очереди и
+// только после её исчерпания снова идёт в ядро.
 func (t *TUN) Read(buf []byte) (int, error) {
-	bufs := [][]byte{t.rdScratch}
-	sizes := []int{0}
-	n, err := t.dev.Read(bufs, sizes, internal.TUNOffset)
-	if err != nil {
-		// При закрытии возвращаем io.EOF, чтобы цикл чтения вышел тихо.
-		if errors.Is(err, fs.ErrClosed) {
-			return 0, io.EOF
+	if t.rdNext >= t.rdAvail {
+		n, err := t.dev.Read(t.rdBufs, t.rdSizes, internal.TUNOffset)
+		if err != nil {
+			// ErrTooManySegments — рекомендация библиотеки: читалку не
+			// останавливать (см. wireguard/tun/errors.go). Сегменты, которые
+			// УСПЕЛИ влезть в наши буфера, валидны и доступны в bufs[0:n].
+			if errors.Is(err, tun.ErrTooManySegments) {
+				log.Printf("TUN: dropped TSO/GRO super-packet (got %d segments, batch=%d)",
+					n, len(t.rdBufs))
+				if n <= 0 {
+					return 0, nil
+				}
+				// fallthrough: отдадим n сегментов по одному.
+			} else if errors.Is(err, fs.ErrClosed) {
+				return 0, io.EOF
+			} else {
+				return 0, err
+			}
 		}
-		return 0, err
+		if n <= 0 {
+			return 0, nil
+		}
+		t.rdAvail = n
+		t.rdNext = 0
 	}
-	if n == 0 {
+
+	idx := t.rdNext
+	t.rdNext++
+	size := t.rdSizes[idx]
+	if size <= 0 {
 		return 0, nil
 	}
-	size := sizes[0]
 	if size > len(buf) {
 		return 0, fmt.Errorf("packet of %d bytes does not fit into %d-byte buffer", size, len(buf))
 	}
-	copy(buf, t.rdScratch[internal.TUNOffset:internal.TUNOffset+size])
+	copy(buf, t.rdBufs[idx][internal.TUNOffset:internal.TUNOffset+size])
 	return size, nil
 }
 
