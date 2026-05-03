@@ -213,7 +213,27 @@ func (t *WSClientTransport) reconnect(broken *websocket.Conn) error {
 
 		conn, err := t.dialNew()
 		if err == nil {
+			// Если Close() успел отработать, пока мы висели в dialNew — новое
+			// соединение никому не принадлежит и должно быть закрыто, иначе TCP-сокет
+			// и буферы gorilla/websocket останутся жить до GC.
+			select {
+			case <-t.done:
+				_ = conn.Close()
+				return errClosed
+			default:
+			}
 			t.conn.Store(conn)
+			// Повторная проверка: Close() мог сработать ровно между select'ом и
+			// Store. В этом случае Close уже сделал Swap(nil) и вернулся, не зная
+			// про нашу новую conn — забираем её обратно и закрываем сами.
+			select {
+			case <-t.done:
+				if orphan := t.conn.Swap(nil); orphan != nil {
+					_ = orphan.Close()
+				}
+				return errClosed
+			default:
+			}
 			log.Printf("websocket: reconnected to %s", t.cfg.URL)
 			return nil
 		}
