@@ -16,8 +16,10 @@ info:
     VPN-сервера, например https://vpn.example.com . Сам путь /ws при этом
     оставьте как есть — он совпадает с MYVPN_WEBHOOK_PATH по умолчанию.
 
-    Headers X-Yc-Apigateway-Websocket-* API Gateway добавляет в HTTP-запрос
-    к интеграции автоматически — явно перечислять их в headers не требуется.
+    ВНИМАНИЕ: блоки `headers:` ниже обязательны. У интеграции `type: http`
+    Yandex API Gateway по умолчанию НЕ форвардит заголовки
+    X-Yc-Apigateway-Websocket-* — без явного substitution бэкенд получит
+    POST без connection-id и event-type и ответит 400.
 
 paths:
   /ws:
@@ -26,22 +28,36 @@ paths:
         type: http
         url: https://VPN_SERVER_URL/ws
         method: POST
+        headers:
+          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
+          X-Yc-Apigateway-Websocket-Event-Type: 'CONNECT'
+          X-Yc-Apigateway-Websocket-Connected-At: '{X-Yc-Apigateway-Websocket-Connected-At}'
         timeouts:
           connect: 5
           read: 30
+
     x-yc-apigateway-websocket-message:
       x-yc-apigateway-integration:
         type: http
         url: https://VPN_SERVER_URL/ws
         method: POST
+        headers:
+          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
+          X-Yc-Apigateway-Websocket-Event-Type: 'MESSAGE'
         timeouts:
           connect: 5
           read: 60
+
     x-yc-apigateway-websocket-disconnect:
       x-yc-apigateway-integration:
         type: http
         url: https://VPN_SERVER_URL/ws
         method: POST
+        headers:
+          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
+          X-Yc-Apigateway-Websocket-Event-Type: 'DISCONNECT'
+          X-Yc-Apigateway-Websocket-Disconnect-Status-Code: '{X-Yc-Apigateway-Websocket-Disconnect-Status-Code}'
+          X-Yc-Apigateway-Websocket-Disconnect-Reason: '{X-Yc-Apigateway-Websocket-Disconnect-Reason}'
         timeouts:
           connect: 5
           read: 10
