@@ -16,10 +16,11 @@ info:
     VPN-сервера, например https://vpn.example.com . Сам путь /ws при этом
     оставьте как есть — он совпадает с MYVPN_WEBHOOK_PATH по умолчанию.
 
-    ВНИМАНИЕ: блоки `headers:` ниже обязательны. У интеграции `type: http`
-    Yandex API Gateway по умолчанию НЕ форвардит заголовки
-    X-Yc-Apigateway-Websocket-* — без явного substitution бэкенд получит
-    POST без connection-id и event-type и ответит 400.
+    ВНИМАНИЕ: блок `headers: { '*': '*' }` ниже обязателен. У `type: http`
+    интеграции Yandex API Gateway по умолчанию НЕ форвардит заголовки
+    оригинального запроса — `'*': '*'` явно говорит: «передай все заголовки
+    как есть». Без этого бэкенд получит POST без X-Yc-Apigateway-Websocket-
+    Connection-Id и X-Yc-Apigateway-Websocket-Event-Type и ответит 400.
 
 paths:
   /ws:
@@ -29,9 +30,7 @@ paths:
         url: https://VPN_SERVER_URL/ws
         method: POST
         headers:
-          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-          X-Yc-Apigateway-Websocket-Event-Type: 'CONNECT'
-          X-Yc-Apigateway-Websocket-Connected-At: '{X-Yc-Apigateway-Websocket-Connected-At}'
+          '*': '*'
         timeouts:
           connect: 5
           read: 30
@@ -42,8 +41,7 @@ paths:
         url: https://VPN_SERVER_URL/ws
         method: POST
         headers:
-          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-          X-Yc-Apigateway-Websocket-Event-Type: 'MESSAGE'
+          '*': '*'
         timeouts:
           connect: 5
           read: 60
@@ -54,10 +52,7 @@ paths:
         url: https://VPN_SERVER_URL/ws
         method: POST
         headers:
-          X-Yc-Apigateway-Websocket-Connection-Id: '{X-Yc-Apigateway-Websocket-Connection-Id}'
-          X-Yc-Apigateway-Websocket-Event-Type: 'DISCONNECT'
-          X-Yc-Apigateway-Websocket-Disconnect-Status-Code: '{X-Yc-Apigateway-Websocket-Disconnect-Status-Code}'
-          X-Yc-Apigateway-Websocket-Disconnect-Reason: '{X-Yc-Apigateway-Websocket-Disconnect-Reason}'
+          '*': '*'
         timeouts:
           connect: 5
           read: 10
