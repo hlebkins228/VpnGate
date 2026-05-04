@@ -204,21 +204,35 @@ func (p *MetadataIAMToken) Token(ctx context.Context) (string, error) {
 //  3. envName (если задан и переменная не пустая) — статический из ENV.
 //  4. metadataURL (если задан) — metadata-сервис.
 //
-// Если ни один источник не указан, возвращается ошибка.
-func LoadIAMTokenProvider(iamTokenFile, iamTokenValue, envName, metadataURL string) (IAMTokenProvider, error) {
+// Если ни один источник не указан, возвращается ошибка. Возвращает также
+// человекочитаемое описание выбранного источника — для информативного
+// логирования при старте сервера.
+func LoadIAMTokenProvider(iamTokenFile, iamTokenValue, envName, metadataURL string) (IAMTokenProvider, string, error) {
 	if iamTokenFile != "" {
-		return NewFileIAMToken(iamTokenFile, 0)
+		p, err := NewFileIAMToken(iamTokenFile, 0)
+		if err != nil {
+			return nil, "", err
+		}
+		return p, fmt.Sprintf("file %q", iamTokenFile), nil
 	}
 	if iamTokenValue != "" {
-		return NewStaticIAMToken(iamTokenValue)
+		p, err := NewStaticIAMToken(iamTokenValue)
+		if err != nil {
+			return nil, "", err
+		}
+		return p, "static value", nil
 	}
 	if envName != "" {
 		if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
-			return NewStaticIAMToken(v)
+			p, err := NewStaticIAMToken(v)
+			if err != nil {
+				return nil, "", err
+			}
+			return p, fmt.Sprintf("env %s", envName), nil
 		}
 	}
 	if metadataURL != "" {
-		return NewMetadataIAMToken(metadataURL), nil
+		return NewMetadataIAMToken(metadataURL), fmt.Sprintf("compute metadata service (%s)", metadataURL), nil
 	}
-	return nil, errors.New("no IAM token source configured (use -iam-token, -iam-token-file or -iam-metadata)")
+	return nil, "", errors.New("no IAM token source configured (use -iam-token, -iam-token-file or -iam-metadata)")
 }

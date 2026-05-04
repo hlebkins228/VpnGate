@@ -74,7 +74,7 @@ func main() {
 
 	var pushClient *transport.YCPushClient
 	if !disableYC {
-		tokens, err := transport.LoadIAMTokenProvider(
+		tokens, source, err := transport.LoadIAMTokenProvider(
 			iamTokenFile,
 			"", // -iam-token флаг убран; чувствительные значения только из env
 			"YC_IAM_TOKEN",
@@ -86,6 +86,29 @@ func main() {
 				"or run on a Yandex Cloud VM with a service account attached. "+
 				"For local testing without IAM, set MYVPN_DISABLE_YANDEX_API=true and pass -direct-ws.", err)
 		}
+		log.Printf("IAM: token source: %s", source)
+
+		// Делаем разовую проверку источника на старте — лучше упасть/предупредить
+		// сейчас, чем уйти в loop "Error sending packet ... metadata IAM token
+		// request failed: context deadline exceeded" на каждом исходящем
+		// пакете. Особенно важно при metadata-источнике, который на внешних
+		// VPS никогда не отвечает (169.254.169.254 не маршрутизируется).
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, probeErr := tokens.Token(probeCtx)
+		probeCancel()
+		if probeErr != nil {
+			log.Printf("IAM: WARNING — initial token probe failed: %v", probeErr)
+			log.Printf("IAM: server is running on a host where source %s does NOT work.", source)
+			log.Printf("IAM: pushes to API Gateway will fail until you fix the IAM source.")
+			log.Printf("IAM: typical fixes:")
+			log.Printf("IAM:   * external VPS — set MYVPN_IAM_TOKEN_FILE=/path/to/token and refresh via cron:")
+			log.Printf("IAM:       echo '0 * * * * yc iam create-token > /path/to/token' | crontab -")
+			log.Printf("IAM:   * one-shot test — export YC_IAM_TOKEN=\"$(yc iam create-token)\" before launching the server")
+			log.Printf("IAM:   * Yandex Compute Cloud VM — attach a service account with role api-gateway.websocketWriter")
+		} else {
+			log.Printf("IAM: initial token probe OK")
+		}
+
 		pushClient, err = transport.NewYCPushClient(transport.YCPushClientConfig{
 			BaseURL:       yandexAPIBase,
 			TokenProvider: tokens,
