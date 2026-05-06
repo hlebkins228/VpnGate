@@ -60,12 +60,19 @@ type WSClientConfig struct {
 	InsecureSkipVerify bool
 	// Verbose подробное логирование (handshakes, reconnects).
 	Verbose bool
+	// BatchCoalesceWindow время ожидания соседних пакетов перед отправкой WS-сообщения.
+	// 0 = DefaultBatchCoalesceWindow. <0 отключает батчинг (каждый пакет — отдельное WS-сообщение).
+	BatchCoalesceWindow time.Duration
+	// BatchMaxBytes максимальный размер одного батча в байтах. 0 = MaxBatchPayloadBytes.
+	BatchMaxBytes int
 }
 
 // WSClientTransport — WebSocket-транспорт для VPN клиента.
 //
 // Используется как двунаправленный канал поверх wss:// до Yandex API Gateway.
-// Каждый VPN-пакет отправляется как одно бинарное WebSocket-сообщение.
+// VPN-пакеты склеиваются в батчи (см. internal/transport/batch.go) и
+// отправляются одним бинарным WebSocket-сообщением, что радикально снижает
+// число вебхуков, генерируемых API Gateway на бэкенд.
 //
 // Транспорт самостоятельно переподключается при потере соединения с
 // экспоненциальным backoff. Yandex API Gateway принудительно разрывает
@@ -91,6 +98,16 @@ type WSClientTransport struct {
 
 	// reconnectEnabled = false → Read/Write возвращают ошибку при разрыве.
 	reconnectEnabled bool
+
+	// batcher склеивает исходящие VPN-пакеты в один WS-фрейм. nil при
+	// BatchCoalesceWindow < 0 (тогда Write отправляет каждый пакет как отдельное
+	// сообщение, для совместимости с тестами или отладки).
+	batcher *batchedWriter
+
+	// readMu защищает pending — буфер декодированных VPN-пакетов, ещё не
+	// отданных через Read.
+	readMu  sync.Mutex
+	pending [][]byte
 }
 
 // NewWSClientTransport устанавливает WS соединение и возвращает готовый транспорт.
@@ -139,6 +156,14 @@ func NewWSClientTransport(cfg WSClientConfig) (*WSClientTransport, error) {
 		cfg:              cfg,
 		done:             make(chan struct{}),
 		reconnectEnabled: reconnect,
+	}
+
+	coalesce := cfg.BatchCoalesceWindow
+	if coalesce == 0 {
+		coalesce = DefaultBatchCoalesceWindow
+	}
+	if coalesce >= 0 {
+		t.batcher = newBatchedWriter(coalesce, cfg.BatchMaxBytes, t.flushBatch)
 	}
 
 	conn, err := t.dialNew()
@@ -259,50 +284,81 @@ func (t *WSClientTransport) invalidateConn(broken *websocket.Conn) {
 	}
 }
 
-// Write отправляет одно бинарное WebSocket сообщение.
+// Write передаёт один VPN-пакет в батчер. Фактическая отправка по WebSocket
+// выполняется при срабатывании окна склеивания или переполнении буфера.
 //
-// При reconnectEnabled=true и временной ошибке записи: помечает соединение
-// сломанным и возвращает nil (пакет «потерян», но Read-горутина переподключит
-// транспорт). Это предпочтительно для VPN-трафика — TCP внутри туннеля сам
-// перешлёт пропавшие пакеты, а возврат ошибки наверх вызвал бы каскадный
-// shutdown VPN-клиента.
+// Для случая BatchCoalesceWindow < 0 батчер отключён, и Write отправляет пакет
+// сразу одним WS-сообщением (length-prefix-framing сохраняется ради
+// совместимости формата).
+//
+// Ошибки сети обрабатываются в flushBatch (соединение помечается сломанным,
+// Read-горутина переподключит транспорт). VPN-пакет в этот момент «теряется»,
+// но TCP внутри туннеля сам перешлёт.
 func (t *WSClientTransport) Write(data []byte) (int, error) {
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-
 	select {
 	case <-t.done:
 		return 0, errClosed
 	default:
 	}
 
+	if t.batcher != nil {
+		if err := t.batcher.Add(data); err != nil {
+			return 0, err
+		}
+		return len(data), nil
+	}
+
+	// Батчинг отключён — отправляем один пакет в своём WS-сообщении (но всё
+	// равно с length-prefix-framing'ом, чтобы приёмная сторона ожидала единый формат).
+	frame, err := AppendFrame(nil, data)
+	if err != nil {
+		return 0, err
+	}
+	t.flushBatch(frame)
+	return len(data), nil
+}
+
+// flushBatch вызывается батчером при готовности батча. Пишет пакет одним
+// бинарным WS-сообщением. Активная синхронизация с reconnect/Close идёт
+// через writeMu и atomic conn.
+func (t *WSClientTransport) flushBatch(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+
+	select {
+	case <-t.done:
+		return
+	default:
+	}
+
 	conn := t.conn.Load()
 	if conn == nil {
-		if t.reconnectEnabled {
-			// Транспорт переподключается; молча дропаем пакет.
-			return len(data), nil
-		}
-		return 0, errors.New("websocket not connected")
+		// Переподключаемся — молча дропаем батч.
+		return
 	}
 
 	if t.cfg.WriteTimeout > 0 {
 		_ = conn.SetWriteDeadline(time.Now().Add(t.cfg.WriteTimeout))
 	}
-	if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+	if err := conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
 		if t.reconnectEnabled {
 			if t.cfg.Verbose {
 				log.Printf("websocket: write error: %v; will reconnect on next read", err)
 			}
 			t.invalidateConn(conn)
-			return len(data), nil
 		}
-		return 0, err
 	}
-	return len(data), nil
 }
 
-// Read блокируется до получения следующего бинарного сообщения и копирует его в buf.
+// Read блокируется до получения следующего VPN-пакета и копирует его в buf.
 // Возвращает количество записанных в buf байт.
+//
+// Одно WebSocket-сообщение может содержать несколько сбатченных VPN-пакетов;
+// Read отдаёт их по одному на вызов, остальные хранятся в t.pending.
 //
 // При reconnectEnabled=true ошибки сети не возвращаются наверх: транспорт
 // автоматически переподключается с backoff'ом. Read возвращает ошибку только
@@ -314,6 +370,19 @@ func (t *WSClientTransport) Read(buf []byte) (int, error) {
 			return 0, errClosed
 		default:
 		}
+
+		// Сначала отдаём ожидающие пакеты из разобранного предыдущего батча.
+		t.readMu.Lock()
+		if len(t.pending) > 0 {
+			frame := t.pending[0]
+			t.pending = t.pending[1:]
+			t.readMu.Unlock()
+			if len(frame) > len(buf) {
+				return 0, fmt.Errorf("websocket buffer too small: got %d bytes, buffer is %d", len(frame), len(buf))
+			}
+			return copy(buf, frame), nil
+		}
+		t.readMu.Unlock()
 
 		conn := t.conn.Load()
 		if conn == nil {
@@ -346,11 +415,24 @@ func (t *WSClientTransport) Read(buf []byte) (int, error) {
 			// текстовые сообщения игнорируем — VPN использует только бинарный канал
 			continue
 		}
-		if len(payload) > len(buf) {
-			return 0, fmt.Errorf("websocket buffer too small: got %d bytes, buffer is %d", len(payload), len(buf))
+
+		// Разбираем батч на отдельные VPN-пакеты. gorilla переиспользует payload
+		// между вызовами ReadMessage, поэтому каждый пакет копируем.
+		var frames [][]byte
+		if err := IterateFrames(payload, func(p []byte) error {
+			frames = append(frames, append([]byte(nil), p...))
+			return nil
+		}); err != nil {
+			log.Printf("websocket: malformed batch: %v; %d bytes dropped", err, len(payload))
+			continue
 		}
-		n := copy(buf, payload)
-		return n, nil
+		if len(frames) == 0 {
+			continue
+		}
+
+		t.readMu.Lock()
+		t.pending = append(t.pending, frames...)
+		t.readMu.Unlock()
 	}
 }
 
@@ -398,6 +480,11 @@ func (t *WSClientTransport) Close() error {
 	t.closed = true
 	close(t.done)
 	t.closeMu.Unlock()
+
+	// Останавливаем батчер — не флашим накопленное: соединение всё равно закрываем.
+	if t.batcher != nil {
+		t.batcher.Close()
+	}
 
 	conn := t.conn.Swap(nil)
 

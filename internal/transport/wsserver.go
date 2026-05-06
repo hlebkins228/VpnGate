@@ -29,6 +29,10 @@ const (
 	EventDisconnect = "DISCONNECT"
 )
 
+// errShutdownInProgress — sentinel-ошибка, прерывающая итерацию по фреймам
+// батча, когда транспорт получил сигнал shutdown (см. handleWebhook / handleDirectWS).
+var errShutdownInProgress = errors.New("server shutting down")
+
 // IncomingPacket — пакет, полученный от какого-либо клиента.
 type IncomingPacket struct {
 	// ConnID идентификатор соединения (заголовок X-Yc-Apigateway-Websocket-Connection-Id).
@@ -42,6 +46,12 @@ type IncomingPacket struct {
 //
 // Реализуется либо через Yandex Connection Management API (webhook режим),
 // либо напрямую в WebSocket connection (direct режим).
+//
+// Исходящие VPN-пакеты склеиваются в батчи внутри реализации sink'а,
+// и фактическая отправка (Connection API или запись в WS) выполняется асинхронно:
+// по окну склеивания или переполнению буфера. Send возвращает nil или локальную
+// ошибку валидации (пакет слишком большой); сетевые ошибки логируются внутри
+// flush'а (TCP внутри туннеля перешлёт потерянные батчи).
 type connSink interface {
 	Send(ctx context.Context, data []byte) error
 	Close() error
@@ -52,18 +62,44 @@ type directWSSink struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 	timeout time.Duration
+	verbose bool
+	connID  string
+	batcher *batchedWriter
 }
 
-func (s *directWSSink) Send(_ context.Context, data []byte) error {
+func newDirectWSSink(conn *websocket.Conn, connID string, timeout, coalesce time.Duration, maxBytes int, verbose bool) *directWSSink {
+	s := &directWSSink{
+		conn:    conn,
+		timeout: timeout,
+		verbose: verbose,
+		connID:  connID,
+	}
+	s.batcher = newBatchedWriter(coalesce, maxBytes, s.flushBatch)
+	return s
+}
+
+func (s *directWSSink) flushBatch(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.timeout > 0 {
 		_ = s.conn.SetWriteDeadline(time.Now().Add(s.timeout))
 	}
-	return s.conn.WriteMessage(websocket.BinaryMessage, data)
+	if err := s.conn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
+		if s.verbose {
+			log.Printf("ws/direct: write error to %s: %v", s.connID, err)
+		}
+	}
+}
+
+func (s *directWSSink) Send(_ context.Context, data []byte) error {
+	return s.batcher.Add(data)
 }
 
 func (s *directWSSink) Close() error {
+	s.batcher.Close()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_ = s.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
@@ -74,15 +110,49 @@ func (s *directWSSink) Close() error {
 
 // gatewaySink — sink, отправляющий пакет через Yandex Connection Management API.
 type gatewaySink struct {
-	push   *YCPushClient
-	connID string
+	push     *YCPushClient
+	connID   string
+	timeout  time.Duration
+	verbose  bool
+	batcher  *batchedWriter
 }
 
-func (s *gatewaySink) Send(ctx context.Context, data []byte) error {
-	return s.push.SendBinary(ctx, s.connID, data)
+func newGatewaySink(push *YCPushClient, connID string, pushTimeout, coalesce time.Duration, maxBytes int, verbose bool) *gatewaySink {
+	s := &gatewaySink{
+		push:    push,
+		connID:  connID,
+		timeout: pushTimeout,
+		verbose: verbose,
+	}
+	s.batcher = newBatchedWriter(coalesce, maxBytes, s.flushBatch)
+	return s
 }
 
-func (s *gatewaySink) Close() error { return nil }
+func (s *gatewaySink) flushBatch(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+	timeout := s.timeout
+	if timeout <= 0 {
+		timeout = pushDefaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := s.push.SendBinary(ctx, s.connID, payload); err != nil {
+		if s.verbose {
+			log.Printf("ws/gateway: push error to %s: %v", s.connID, err)
+		}
+	}
+}
+
+func (s *gatewaySink) Send(_ context.Context, data []byte) error {
+	return s.batcher.Add(data)
+}
+
+func (s *gatewaySink) Close() error {
+	s.batcher.Close()
+	return nil
+}
 
 // WSServerConfig параметры WebSocket-серверного транспорта.
 type WSServerConfig struct {
@@ -98,7 +168,8 @@ type WSServerConfig struct {
 	// PushClient клиент Yandex Connection Management API.
 	// Обязателен, если хотя бы один клиент должен подключаться через API Gateway.
 	PushClient *YCPushClient
-	// IncomingQueueSize размер канала входящих пакетов. По умолчанию 1024.
+	// IncomingQueueSize размер канала входящих пакетов. По умолчанию 4096 (выше чем было
+	// до батчинга, т.к. один вебхук теперь вносит до ~60 VPN-пакетов).
 	IncomingQueueSize int
 	// WriteTimeout таймаут на запись в прямой WS. 0 = WSDefaultWriteTimeout.
 	WriteTimeout time.Duration
@@ -109,6 +180,11 @@ type WSServerConfig struct {
 	// PushContextTimeout таймаут на одну отправку через Connection API.
 	// 0 = pushDefaultTimeout.
 	PushContextTimeout time.Duration
+	// BatchCoalesceWindow время ожидания соседних исходящих пакетов перед флашем батча.
+	// 0 = DefaultBatchCoalesceWindow. <0 отключает батчинг.
+	BatchCoalesceWindow time.Duration
+	// BatchMaxBytes максимальный размер одного батча. 0 = MaxBatchPayloadBytes.
+	BatchMaxBytes int
 }
 
 // WSServerTransport — серверный транспорт, мультиклиентный.
@@ -136,7 +212,9 @@ type WSServerTransport struct {
 	closed  bool
 	closeMu sync.Mutex
 
-	pushTimeout time.Duration
+	pushTimeout         time.Duration
+	batchCoalesceWindow time.Duration
+	batchMaxBytes       int
 }
 
 // NewWSServerTransport создаёт серверный транспорт и запускает HTTP сервер.
@@ -154,7 +232,7 @@ func NewWSServerTransport(cfg WSServerConfig) (*WSServerTransport, error) {
 		cfg.DirectWSPath = "/" + cfg.DirectWSPath
 	}
 	if cfg.IncomingQueueSize <= 0 {
-		cfg.IncomingQueueSize = 1024
+		cfg.IncomingQueueSize = 4096
 	}
 	if cfg.WriteTimeout == 0 {
 		cfg.WriteTimeout = WSDefaultWriteTimeout
@@ -167,12 +245,19 @@ func NewWSServerTransport(cfg WSServerConfig) (*WSServerTransport, error) {
 		pushTimeout = pushDefaultTimeout
 	}
 
+	coalesce := cfg.BatchCoalesceWindow
+	if coalesce == 0 {
+		coalesce = DefaultBatchCoalesceWindow
+	}
+
 	t := &WSServerTransport{
-		cfg:         cfg,
-		conns:       make(map[string]connSink),
-		incoming:    make(chan IncomingPacket, cfg.IncomingQueueSize),
-		done:        make(chan struct{}),
-		pushTimeout: pushTimeout,
+		cfg:                 cfg,
+		conns:               make(map[string]connSink),
+		incoming:            make(chan IncomingPacket, cfg.IncomingQueueSize),
+		done:                make(chan struct{}),
+		pushTimeout:         pushTimeout,
+		batchCoalesceWindow: coalesce,
+		batchMaxBytes:       cfg.BatchMaxBytes,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  WSMaxMessageSize,
 			WriteBufferSize: WSMaxMessageSize,
@@ -377,14 +462,33 @@ func (t *WSServerTransport) handleWebhook(w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		select {
-		case t.incoming <- IncomingPacket{ConnID: connID, Data: body}:
-		case <-t.done:
+		// Разбираем батч на VPN-пакеты и каждый кладём в водящую очередь.
+		dropped := 0
+		shuttingDown := false
+		iterErr := IterateFrames(body, func(frame []byte) error {
+			select {
+			case t.incoming <- IncomingPacket{ConnID: connID, Data: append([]byte(nil), frame...)}:
+			case <-t.done:
+				shuttingDown = true
+				return errShutdownInProgress
+			default:
+				// Очередь переполнена — дропаем пакет, но не обрубаем весь батч
+				// (TCP внутри туннеля перешлёт потери).
+				dropped++
+			}
+			return nil
+		})
+		if shuttingDown {
 			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
 			return
-		default:
-			http.Error(w, "incoming queue is full", http.StatusServiceUnavailable)
+		}
+		if iterErr != nil {
+			log.Printf("ws/webhook: malformed batch from %s: %v", connID, iterErr)
+			http.Error(w, "malformed batch payload", http.StatusBadRequest)
 			return
+		}
+		if dropped > 0 && t.cfg.Verbose {
+			log.Printf("ws/webhook: incoming queue full, dropped %d packet(s) from %s", dropped, connID)
 		}
 
 		// Возвращаем пустой бинарный ответ. Yandex API Gateway отправит тело
@@ -415,7 +519,7 @@ func (t *WSServerTransport) registerGatewayConn(connID string) bool {
 	if _, exists := t.conns[connID]; exists {
 		return false
 	}
-	t.conns[connID] = &gatewaySink{push: t.cfg.PushClient, connID: connID}
+	t.conns[connID] = newGatewaySink(t.cfg.PushClient, connID, t.pushTimeout, t.batchCoalesceWindow, t.batchMaxBytes, t.cfg.Verbose)
 	return true
 }
 
@@ -470,7 +574,7 @@ func (t *WSServerTransport) handleDirectWS(w http.ResponseWriter, r *http.Reques
 		})
 	}
 
-	sink := &directWSSink{conn: conn, timeout: t.cfg.WriteTimeout}
+	sink := newDirectWSSink(conn, connID, t.cfg.WriteTimeout, t.batchCoalesceWindow, t.batchMaxBytes, t.cfg.Verbose)
 	t.connsMu.Lock()
 	t.conns[connID] = sink
 	t.connsMu.Unlock()
@@ -502,10 +606,23 @@ func (t *WSServerTransport) handleDirectWS(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 
-		select {
-		case t.incoming <- IncomingPacket{ConnID: connID, Data: payload}:
-		case <-t.done:
+		// Разбираем батч на отдельные VPN-пакеты. payload переиспользуется
+		// gorilla между ReadMessage'ами, поэтому каждый пакет копируем.
+		var shutdown bool
+		iterErr := IterateFrames(payload, func(frame []byte) error {
+			select {
+			case t.incoming <- IncomingPacket{ConnID: connID, Data: append([]byte(nil), frame...)}:
+				return nil
+			case <-t.done:
+				shutdown = true
+				return errShutdownInProgress
+			}
+		})
+		if shutdown {
 			return
+		}
+		if iterErr != nil {
+			log.Printf("ws/direct: malformed batch from %s: %v", connID, iterErr)
 		}
 	}
 }

@@ -110,7 +110,11 @@ func TestWebhookFlow(t *testing.T) {
 	doWebhook(t, gwBase, connID, "CONNECT", nil)
 
 	payload := []byte("encrypted-packet")
-	doWebhook(t, gwBase, connID, "MESSAGE", payload)
+	framed, err := AppendFrame(nil, payload)
+	if err != nil {
+		t.Fatalf("AppendFrame: %v", err)
+	}
+	doWebhook(t, gwBase, connID, "MESSAGE", framed)
 
 	pkt, err := readWithTimeout(srv, 2*time.Second)
 	if err != nil {
@@ -128,9 +132,24 @@ func TestWebhookFlow(t *testing.T) {
 		t.Fatalf("server Send: %v", err)
 	}
 
+	// Send в новом транспорте складывает пакет в батчер; фактический push
+	// произойдёт после окна склеивания (DefaultBatchCoalesceWindow). Ждём,
+	// пока запись долетит до httptest-сервера Connection API.
+	if err := waitForCondition(2*time.Second, func() bool {
+		return len(rec.sent(connID)) >= 1
+	}); err != nil {
+		t.Fatalf("waiting for push: %v", err)
+	}
+
 	got := rec.sent(connID)
-	if len(got) != 1 || !bytes.Equal(got[0], reply) {
-		t.Fatalf("push API got %v, want [%q]", got, reply)
+	// Каждый сеанс flush'а — это один батч, содержащий N сбатченных VPN-пакетов.
+	// В этом тесте одна Send-операция → один батч → одна push-запись.
+	expectFramed, err := AppendFrame(nil, reply)
+	if err != nil {
+		t.Fatalf("AppendFrame reply: %v", err)
+	}
+	if len(got) != 1 || !bytes.Equal(got[0], expectFramed) {
+		t.Fatalf("push API got %v, want [%q]", got, expectFramed)
 	}
 	if rec.lastAuthHeader() != "Bearer test-iam-token" {
 		t.Fatalf("push API got Authorization %q, want %q", rec.lastAuthHeader(), "Bearer test-iam-token")
@@ -141,6 +160,21 @@ func TestWebhookFlow(t *testing.T) {
 	if err := srv.Send(connID, reply); err == nil {
 		t.Fatalf("expected Send to fail after disconnect")
 	}
+}
+
+// waitForCondition polls cond() с интервалом 5 мс до d или до выполнения условия.
+func waitForCondition(d time.Duration, cond func() bool) error {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if cond() {
+		return nil
+	}
+	return errTimeout("condition not met within timeout")
 }
 
 // doWebhook отправляет HTTP-вебхук в серверный транспорт, имитируя Yandex API Gateway.
