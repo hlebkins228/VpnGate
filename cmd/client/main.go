@@ -18,6 +18,7 @@ import (
 	"log"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -50,6 +51,17 @@ func main() {
 	}
 	if *keyFile == "" {
 		log.Fatal("Key file is required. Pass -key /path/to/key or set MYVPN_KEY env var.")
+	}
+
+	// Yandex API Gateway всегда отдаёт WebSocket по TLS — попытка ходить по
+	// ws:// на *.apigw.yandexcloud.net стабильно ломается с "bad handshake",
+	// потому что edge закрывает соединение во время Upgrade. Чтобы не ловить
+	// эту классическую ошибку, апгрейдим схему сами и громко предупреждаем.
+	if upgraded, ok := upgradeAPIGatewayScheme(*serverURL); ok {
+		log.Printf("WARNING: %s uses ws://, but Yandex API Gateway requires TLS — "+
+			"upgrading to %s. Use wss:// in -server / MYVPN_SERVER to suppress this warning.",
+			*serverURL, upgraded)
+		*serverURL = upgraded
 	}
 
 	// Печатаем эффективную конфигурацию ДО подключения, чтобы при разборе
@@ -176,4 +188,26 @@ type headerParseError struct{ Raw string }
 
 func (e *headerParseError) Error() string {
 	return "expected 'Key: Value' header, got: " + e.Raw
+}
+
+// upgradeAPIGatewayScheme возвращает (newURL, true) если raw — это ws://...
+// на хост, который точно требует TLS (домены Yandex API Gateway). В остальных
+// случаях — ("", false), и URL остаётся как есть.
+//
+// Список захардкожен сознательно: апгрейдить любую ws://-ссылку на wss:// без
+// спроса нельзя — у пользователя может быть свой direct-ws сервер без TLS,
+// и тогда мы только сломаем рабочую конфигурацию.
+func upgradeAPIGatewayScheme(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "ws" {
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	switch {
+	case strings.HasSuffix(host, ".apigw.yandexcloud.net"),
+		strings.HasSuffix(host, ".apigw.cloud.yandex.net"):
+		u.Scheme = "wss"
+		return u.String(), true
+	}
+	return "", false
 }

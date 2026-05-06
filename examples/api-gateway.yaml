@@ -3,19 +3,48 @@ info:
   title: MyVPN WebSocket Gateway
   version: 1.0.0
   description: |
-    Yandex API Gateway specification for the MyVPN over WebSocket transport.
+    OpenAPI spec for Yandex API Gateway, проксирующего WebSocket до VPN-сервера.
 
-    The gateway accepts client WebSocket connections at /ws and forwards every
-    $connect / $message / $disconnect event to the VPN server's HTTP webhook.
-    The VPN server pushes packets back to clients via the Connection
-    Management API (apigateway-connections.api.cloud.yandex.net).
+    Что делает:
+      * принимает клиентское WebSocket-соединение по пути /ws;
+      * на каждом событии (CONNECT / MESSAGE / DISCONNECT) шлёт HTTP-вебхук
+        на VPN-сервер по адресу из переменной VPN_SERVER_URL;
+      * VPN-сервер пушит ответные пакеты обратно через
+        Connection Management API (apigateway-connections.api.cloud.yandex.net).
 
-    Replace VPN_SERVER_URL below with the public HTTPS URL of your VPN server's
-    webhook endpoint, e.g. https://vpn.example.com:8080/ws
+    Перед загрузкой замените VPN_SERVER_URL на публичный HTTPS-адрес вашего
+    VPN-сервера, например https://vpn.example.com . Сам путь /ws при этом
+    оставьте как есть — он совпадает с MYVPN_WEBHOOK_PATH по умолчанию.
+
+    ВАЖНО про headers
+    -----------------
+    type: http-интеграция Yandex API Gateway по умолчанию НЕ форвардит
+    заголовки оригинального WebSocket-handshake'а на бэкенд. Нельзя в качестве
+    обходного манёвра поставить `'*': '*'` — оно начнёт форвардить hop-by-hop
+    заголовки (Upgrade, Connection, Sec-WebSocket-*), а HTTP/2 frontend'ы
+    (включая ngrok) отбивают такие запросы с 503 ещё до бэкенда.
+
+    Единственный надёжный путь — объявить нужные X-Yc-Apigateway-Websocket-*
+    заголовки в `parameters:` блоке операции и подставить их через `{name}`-
+    syntax в `headers:` интеграции. Список заголовков описан в Yandex-докe:
+    https://yandex.cloud/docs/api-gateway/concepts/extensions/websocket
 
 paths:
   /ws:
+
+    # ---------- CONNECT ----------
     x-yc-apigateway-websocket-connect:
+      parameters:
+        - name: X-Yc-Apigateway-Websocket-Connection-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Yc-Apigateway-Websocket-Connected-At
+          in: header
+          required: false
+          schema:
+            type: string
       x-yc-apigateway-integration:
         type: http
         url: https://VPN_SERVER_URL/ws
@@ -27,7 +56,15 @@ paths:
         timeouts:
           connect: 5
           read: 30
+
+    # ---------- MESSAGE ----------
     x-yc-apigateway-websocket-message:
+      parameters:
+        - name: X-Yc-Apigateway-Websocket-Connection-Id
+          in: header
+          required: true
+          schema:
+            type: string
       x-yc-apigateway-integration:
         type: http
         url: https://VPN_SERVER_URL/ws
@@ -38,7 +75,25 @@ paths:
         timeouts:
           connect: 5
           read: 60
+
+    # ---------- DISCONNECT ----------
     x-yc-apigateway-websocket-disconnect:
+      parameters:
+        - name: X-Yc-Apigateway-Websocket-Connection-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Yc-Apigateway-Websocket-Disconnect-Status-Code
+          in: header
+          required: false
+          schema:
+            type: string
+        - name: X-Yc-Apigateway-Websocket-Disconnect-Reason
+          in: header
+          required: false
+          schema:
+            type: string
       x-yc-apigateway-integration:
         type: http
         url: https://VPN_SERVER_URL/ws
